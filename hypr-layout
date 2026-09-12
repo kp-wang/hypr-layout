@@ -36,6 +36,10 @@ choice instead of being wired to one file:
   hypr-layout restore --pick             menu: which layout, then which workspace
   hypr-layout save --pick                menu: name this layout
   hypr-layout restore --name work        straight to a named layout
+  hypr-layout restore --history          back to one of the last few saves
+
+Every save keeps the few before it in ~/.config/hypr/layout-history/, so a save
+taken at a bad moment does not cost you the good one.
 
 The menu is whatever the desktop provides — `omarchy-menu-select` on Omarchy,
 then wofi, rofi, fuzzel, dmenu.
@@ -65,6 +69,9 @@ from collections import defaultdict
 
 LAYOUT = os.path.expanduser("~/.config/hypr/layout.json")
 LAYOUT_DIR = os.path.expanduser("~/.config/hypr/layouts")
+LAYOUT_HISTORY = os.path.expanduser("~/.config/hypr/layout-history")
+HISTORY_KEEP = 5          # earlier saves kept per layout
+WORKSPACE_RANGE = 10      # numeric workspaces offered (Hyprland has no fixed count)
 HOME = os.path.expanduser("~")
 # Never replayed: transient or WM-internal surfaces.
 SKIP_CLASSES = {"hyprland", "xwaylandvideobridge"}
@@ -310,6 +317,74 @@ def menu_pick(prompt, options, width=460, icon="󱂬"):
              "fuzzel, dmenu) — pass --name or --workspace instead")
 
 
+def stem_of(path):
+    """The file's bare name without .json — how a layout is recognised."""
+    return os.path.basename(path)[:-5] if path.endswith(".json") else os.path.basename(path)
+
+
+def keep_history(path, keep=HISTORY_KEEP):
+    """Rotate the save that is about to be overwritten into a history folder.
+
+    A save taken at a bad moment would otherwise be the only copy. The last few
+    are kept per layout, pruned so this cannot grow without bound, and
+    `restore --history` lists them.
+    """
+    if not os.path.exists(path):
+        return
+    os.makedirs(LAYOUT_HISTORY, exist_ok=True)
+    stem = stem_of(path)
+    dest = os.path.join(LAYOUT_HISTORY, f"{stem}-{time.strftime('%Y%m%d-%H%M%S')}.json")
+    if os.path.exists(dest):
+        return                                    # two saves within one second
+    shutil.copy2(path, dest)
+    olds = sorted(f for f in os.listdir(LAYOUT_HISTORY) if f.startswith(f"{stem}-"))
+    for name in olds[:-keep]:
+        os.remove(os.path.join(LAYOUT_HISTORY, name))
+
+
+def history_files(path):
+    """Earlier saves of one layout, newest first."""
+    if not os.path.isdir(LAYOUT_HISTORY):
+        return []
+    stem = stem_of(path)
+    return [os.path.join(LAYOUT_HISTORY, f)
+            for f in sorted((f for f in os.listdir(LAYOUT_HISTORY)
+                             if f.startswith(f"{stem}-") and f.endswith(".json")),
+                            reverse=True)]
+
+
+def history_label(name):
+    """'20260912-102409' -> '12 Sep 10:24:09'."""
+    try:
+        return time.strftime("%d %b %H:%M:%S", time.strptime(name, "%Y%m%d-%H%M%S"))
+    except ValueError:
+        return name
+
+
+def pick_history(path):
+    """Choose one of the earlier saves of this layout."""
+    files = history_files(path)
+    if not files:
+        sys.exit(f"hypr-layout: no earlier saves of {stem_of(path)} to go back to")
+    rows, by_label = [], {}
+    for f in files:
+        stamp = os.path.basename(f)[len(stem_of(path)) + 1:-5]
+        label = history_label(stamp)          # the file's stamp is the key
+        try:
+            with open(f) as fh:
+                n = len(json.load(fh).get("entries", []))
+        except (OSError, json.JSONDecodeError):
+            n = 0
+        rows.append((label, f"{n} windows"))
+        by_label[label] = f
+    choice = menu_pick(f"Go back to which save of “{stem_of(path)}”?", rows)
+    if not choice:
+        sys.exit("hypr-layout: cancelled")
+    if choice in by_label:
+        return by_label[choice]
+    sys.exit(f"hypr-layout: no save labelled {choice!r}")
+
+
 def ws_sort_key(ws):
     ws = str(ws)
     return (not ws.isdigit(), int(ws) if ws.isdigit() else ws)
@@ -340,14 +415,19 @@ def pick_layout():
 
 
 def pick_workspace(layout, label):
-    """Which workspace? 'as saved' keeps the workspaces the layout recorded."""
-    saved = sorted({str(e["workspace"]) for e in layout["entries"]}, key=ws_sort_key)
-    live = set()
-    for c in clients():
-        live.add(workspace_of(c))
+    """Which workspace? 'keep as saved' keeps the workspaces the layout recorded.
+
+    The numeric list is the full range you can key to, not just the workspaces
+    that happen to exist: Hyprland creates a workspace the moment a window is
+    moved to it, so a number that does not exist yet is still a valid answer.
+    """
+    saved = {str(e["workspace"]) for e in layout["entries"]}
+    live = {workspace_of(c) for c in clients()}
+    spaces = {str(n) for n in range(1, WORKSPACE_RANGE + 1)} | saved | live
     rows = [("keep as saved", "everything back on its own workspace")]
-    for ws in sorted(set(saved) | live, key=ws_sort_key):
-        rows.append((ws, f"move everything to ws{ws}"))
+    for ws in sorted(spaces, key=ws_sort_key):
+        here = " (has windows)" if ws in live else ""
+        rows.append((ws, f"move everything to ws{ws}{here}"))
     choice = menu_pick("Where should it go?", rows)
     if not choice:
         sys.exit("hypr-layout: cancelled")
@@ -455,8 +535,7 @@ def cmd_save(args):
         "entries": entries,
     }
     os.makedirs(os.path.dirname(args.file), exist_ok=True)
-    if os.path.exists(args.file):  # keep the previous save around
-        shutil.copy2(args.file, args.file + ".bak")
+    keep_history(args.file)           # the save about to be replaced, kept aside
     with open(args.file, "w") as fh:
         json.dump(layout, fh, indent=2)
     print(f"saved {len(entries)} windows -> {args.file}")
@@ -470,6 +549,10 @@ def cmd_save(args):
     for s in skipped:
         print(f"  skipped  {s}")
     print("\nedit the entries list to change tiling order; restore replays top to bottom.")
+    hist = len(history_files(args.file))
+    if hist:
+        print(f"{hist} earlier save{'s' if hist != 1 else ''} kept in {LAYOUT_HISTORY} "
+              f"(restore --history goes back)")
 
 
 def cmd_show(args):
@@ -488,11 +571,18 @@ def cmd_layouts(args):
     if not saved:
         print("no layouts saved yet — run `hypr-layout save`")
         return
+    any_history = False
     for name, path, layout in saved:
         n = len(layout.get("entries", []))
+        hist = len(history_files(path))
+        any_history = any_history or bool(hist)
+        extra = f"   {hist} earlier save{'s' if hist != 1 else ''}" if hist else ""
         default = "   (the default)" if path == LAYOUT else ""
         print(f"  {name:<20} {n:>2} window{'s' if n != 1 else ''}   "
-              f"saved {layout.get('saved_at', '?')}{default}")
+              f"saved {layout.get('saved_at', '?')}{default}{extra}")
+    if any_history:
+        print(f"\nearlier saves live in {LAYOUT_HISTORY}; "
+              "`hypr-layout restore --history` goes back to one")
 
 
 def order_for_launch(entries):
@@ -955,6 +1045,8 @@ def cmd_restore(args):
     picked = None
     if getattr(args, "pick", False):
         picked, args.file = pick_layout()
+    if getattr(args, "history", False):
+        args.file = pick_history(args.file)
     layout = load_layout(args.file)
     entries = layout["entries"]
     if args.except_:
@@ -1160,6 +1252,8 @@ def main():
     r.add_argument("--name", help="restore a layout saved with `save --name`")
     r.add_argument("--pick", action="store_true",
                    help="choose the layout and workspace from a menu")
+    r.add_argument("--history", action="store_true",
+                   help="choose one of the last few saves of this layout instead")
     r.set_defaults(func=cmd_restore, verify=True)
 
     sh = sub.add_parser("show", help="print the saved layout")
