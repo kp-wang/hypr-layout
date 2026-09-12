@@ -39,10 +39,14 @@ choice instead of being wired to one file:
   hypr-layout restore --name work        straight to a named layout
   hypr-layout restore --history          back to one of the last few saves
   hypr-layout spill                      send the focused window to ws5
+  hypr-layout tuck                       fold the focused window into the layout
 
 `restore --spill WS` first moves any window on the layout's workspaces that is
 not part of it to WS: a stray window is a tile the saved tree knows nothing
-about, and it splits the arrangement.
+about, and it splits the arrangement. `restore --tuck` folds those windows in
+instead — as a tab in the top-left tile, which costs no space, so the layout is
+untouched — and falls back to floating one over that corner when the tile is
+not a group and there is nothing to join.
 
 Every save keeps the few before it in ~/.config/hypr/layout-history/, so a save
 taken at a bad moment does not cost you the good one.
@@ -608,17 +612,21 @@ def cmd_show(args):
 
 # ── replay ───────────────────────────────────────────────────────────────────
 
-def spill_strays(entries, addresses, target):
-    """Move windows on the layout's workspaces that are not part of it away.
+def stray_windows(entries, addresses):
+    """Windows on the layout's workspaces that are not part of it.
 
-    Anything else on those workspaces is a tile the tree does not know about,
-    and it splits the arrangement — a fifth tile in a 2x2 halves everything.
-    Returns how many were moved.
+    Anything else there is a tile the tree knows nothing about, and it splits
+    the arrangement — a fifth tile in a 2×2 halves everything.
     """
     known = {a for a in addresses.values() if a}
     spaces = {str(e["workspace"]) for e in entries}
-    strays = [c for c in clients()
-              if workspace_of(c) in spaces and c["address"] not in known]
+    return [c for c in clients()
+            if workspace_of(c) in spaces and c["address"] not in known]
+
+
+def spill_strays(entries, addresses, target):
+    """Move the strays away to another workspace."""
+    strays = stray_windows(entries, addresses)
     for c in strays:
         address = c["address"]
         # A stray that has become a tab in one of the layout's tiles has to
@@ -631,6 +639,73 @@ def spill_strays(entries, addresses, target):
         dispatch(f'hl.dsp.window.move({{ workspace = "{target}", follow = false, '
                  f'window = "address:{address}" }})')
     return strays
+
+
+def top_left_entry(entries, addresses):
+    """The entry whose tile is top-left — the one that takes a tucked window."""
+    live = [i for i in range(len(entries)) if addresses.get(i)]
+    if not live:
+        return None
+    # x + y rather than y, then x: a grouped tile sits lower than its
+    # neighbour because of its tab bar, so the top row is not the lowest y.
+    return min(live, key=lambda i: (sum((saved_rect(entries[i]) or (0, 0, 0, 0))[:2]), i))
+
+
+def tuck_window(address, entries, addresses):
+    """Put a window into the layout without changing its shape.
+
+    A tab in a group costs no space, so the tile that takes it keeps its
+    rectangle and the arrangement is untouched — and the window is still on the
+    workspace, one keystroke away, rather than banished. Where the tile is not
+    a group (nothing to join), or the merge does not take, the window floats
+    over that corner instead, which also keeps it out of the tiling tree.
+    Returns what it did, or None.
+    """
+    index = top_left_entry(entries, addresses)
+    if index is None:
+        return None
+    entry = entries[index]
+    anchor = addresses[index]
+    merged = False
+    if entry.get("group"):
+        visible = next((addresses[i] for i, e in enumerate(entries)
+                        if e.get("group") == entry["group"] and e.get("group_active")),
+                       anchor)
+        merged = merge_into_group(anchor, address, entry["workspace"])
+        if merged:
+            focus_checked(visible)    # the tile keeps showing what it showed
+    live = by_address(address)
+    if live and workspace_of(live) == SCRATCH:
+        # A failed merge must not leave the window parked where nothing looks.
+        dispatch(f'hl.dsp.window.move({{ workspace = "{entry["workspace"]}", '
+                 f'follow = false, window = "address:{address}" }})')
+        time.sleep(0.15)
+        merged = False
+    if merged:
+        return f"as a tab in the {entry['class']} tile"
+    rect = saved_rect(entry) or (0, 0, 900, 700)
+    dispatch(f'hl.dsp.window.float({{ action = "enable", '
+             f'window = "address:{address}" }})')
+    dispatch(f'hl.dsp.window.resize({{ x = {rect[2] // 2}, y = {rect[3] // 2}, '
+             f'window = "address:{address}" }})')
+    dispatch(f'hl.dsp.window.move({{ x = {rect[0] + 40}, y = {rect[1] + 40}, '
+             f'window = "address:{address}" }})')
+    return f"floating over the corner of the {entry['class']} tile"
+
+
+def cmd_tuck(args):
+    """Fold the focused window into the layout, rather than moving it away."""
+    address = active_address()
+    client = by_address(address) if address else None
+    if client is None:
+        sys.exit("hypr-layout: no active window to tuck")
+    layout = load_layout(args.file)
+    entries = layout["entries"]
+    addresses = match_existing(existing_pool(False), entries)
+    where = tuck_window(address, entries, addresses)
+    if not where:
+        sys.exit(f"hypr-layout: could not tuck {client['class']} into the layout")
+    print(f"tucked {client['class']} {where}")
 
 
 def dissolve_solo_groups(entries, addresses):
@@ -935,19 +1010,98 @@ def launch_all(entries, stagger):
     return addresses
 
 
+def group_order(group_id):
+    """The addresses of one group, in tab order.
+
+    `grouped` on a client is exactly that: the group's member addresses in tab
+    order, with the first one doubling as the group's key.
+    """
+    for c in clients():
+        members = c.get("grouped") or []
+        if members and members[0] == group_id:
+            return list(members)
+    return []
+
+
+def tab_order_problem(entries, addresses):
+    """{group id -> complaint} for groups whose saved tab order is wrong.
+
+    Tab numbers are not compared literally: a stray tucked into a tile takes a
+    tab of its own and shifts every index after it, which is not the layout
+    being wrong. What has to hold is the *order* of the saved members, and
+    which of them is showing.
+    """
+    live = {c.get("address"): c for c in clients()}
+    if isinstance(addresses, dict):     # callers pass either a dict or a list
+        addresses = [addresses.get(i) for i in range(len(entries))]
+    problems = {}
+    for gid in {e.get("group") for e in entries if e.get("group")}:
+        members = [addresses[i] for i, e in enumerate(entries)
+                   if e.get("group") == gid]
+        keys = {(live[m].get("grouped") or [None])[0] for m in members if m in live}
+        if len(keys) != 1 or None in keys:
+            problems[gid] = "windows are not in one group"
+            continue
+        order = group_order(next(iter(keys)))
+        positions = [order.index(m) for m in members if m in order]
+        if positions != sorted(positions):
+            problems[gid] = "tabs out of order"
+        elif any(live[m].get("visible") != bool(e.get("group_active"))
+                 for m, e in zip(members, [x for x in entries if x.get("group") == gid])
+                 if m in live):
+            problems[gid] = "wrong tab showing"
+    return problems
+
+
 def group_matches(entries, addresses):
-    """True when these windows already form the saved group, tab for tab."""
+    """True when these windows already form the saved group, tab for tab.
+
+    Extra tabs are tolerated — see tab_order_problem — because a stray tucked
+    into the tile is deliberate, and rebuilding the group over it would fight
+    the thing that put it there.
+    """
     live = [by_address(a) for a in addresses if a]
     if len(live) != len(entries) or any(c is None for c in live):
         return False
     keys = {(c.get("grouped") or [None])[0] for c in live}
     if len(keys) != 1 or None in keys:
         return False
-    for e, c in zip(entries, live):
-        _, index, visible = group_of(c)
-        if index != e["group_index"] or visible != bool(e.get("group_active")):
-            return False
-    return True
+    return not tab_order_problem(entries, addresses).get(entries[0].get("group"))
+
+
+def merge_into_group(anchor, addr, workspace):
+    """Make `addr` a tab of the group that `anchor` is in.
+
+    `into_group` only sees a group next door, so the window is parked and
+    re-inserted against the anchor with `preselect` first — that is what makes
+    the two neighbours. Trying the four directions from wherever the window
+    happens to be instead can grab a *different* adjacent group and scramble
+    two tiles at once.
+    """
+    if not focus_checked(addr):
+        return False
+    # A window that is grouped with something else has to leave that group
+    # first, or it cannot be merged into this one.
+    if (by_address(addr) or {}).get("grouped"):
+        dispatch("hl.dsp.window.move({ out_of_group = true })")
+        time.sleep(0.1)
+    focus_checked(anchor)
+    dispatch(f'hl.dsp.window.move({{ workspace = "{SCRATCH}", follow = false, '
+             f'window = "address:{addr}" }})')
+    time.sleep(0.1)
+    if focus_checked(anchor):
+        dispatch('hl.dsp.layout("preselect r")')
+    dispatch(f'hl.dsp.window.move({{ workspace = "{workspace}", follow = false, '
+             f'window = "address:{addr}" }})')
+    time.sleep(0.2)
+    if not focus_checked(addr):
+        return False
+    for direction in ("l", "r", "u", "d"):
+        dispatch(f'hl.dsp.window.move({{ into_group = "{direction}" }})')
+        time.sleep(0.06)
+        if anchor in ((by_address(addr) or {}).get("grouped") or []):
+            return True
+    return False
 
 
 def build_group(entries, addresses):
@@ -965,38 +1119,7 @@ def build_group(entries, addresses):
     dispatch("hl.dsp.group.toggle()")
 
     for e, addr in members[1:]:
-        merged = False
-        if not focus_checked(addr):
-            warn(f"cannot focus {e['class']} to group it")
-            continue
-        # A window that is grouped with something else has to leave that group
-        # first, or it cannot be merged into this one.
-        if (by_address(addr) or {}).get("grouped"):
-            dispatch("hl.dsp.window.move({ out_of_group = true })")
-            time.sleep(0.1)
-        # Then make it a neighbour of the anchor, because `into_group` only
-        # sees a group next door. Parking and re-inserting it against the
-        # anchor with `preselect` is what guarantees that; trying the four
-        # directions from wherever the window happens to be instead can grab a
-        # *different* group that happens to be adjacent, which scrambles two
-        # tiles at once.
-        focus_checked(anchor)
-        dispatch(f'hl.dsp.window.move({{ workspace = "{SCRATCH}", follow = false, '
-                 f'window = "address:{addr}" }})')
-        time.sleep(0.1)
-        if focus_checked(anchor):
-            dispatch('hl.dsp.layout("preselect r")')
-        dispatch(f'hl.dsp.window.move({{ workspace = "{e["workspace"]}", '
-                 f'follow = false, window = "address:{addr}" }})')
-        time.sleep(0.2)
-        if focus_checked(addr):
-            for direction in ("l", "r", "u", "d"):
-                dispatch(f'hl.dsp.window.move({{ into_group = "{direction}" }})')
-                time.sleep(0.06)
-                if anchor in ((by_address(addr) or {}).get("grouped") or []):
-                    merged = True
-                    break
-        if not merged:
+        if not merge_into_group(anchor, addr, e["workspace"]):
             warn(f"could not merge {e['class']} into the group")
 
     visible = next((a for e, a in members if e.get("group_active")), members[0][1])
@@ -1240,6 +1363,12 @@ def cmd_restore(args):
             if moved:
                 print(f"  moved {len(moved)} window(s) not in this layout "
                       f"to ws{args.spill}")
+        if args.tuck:
+            tucked = [c for c in stray_windows(entries, addresses)
+                      if tuck_window(c["address"], entries, addresses)]
+            if tucked:
+                print(f"  tucked {len(tucked)} window(s) not in this layout into "
+                      "the top-left tile")
         dissolve_solo_groups(entries, addresses)
         if grouping:
             for gid in dict.fromkeys(e.get("group") for e in entries if e.get("group")):
@@ -1277,6 +1406,7 @@ def cmd_restore(args):
 def report(entries, addresses):
     """Per-entry check of workspace / tiling / tab, straight from the compositor."""
     live = {c.get("address"): c for c in clients()}
+    tab_problems = tab_order_problem(entries, addresses)
     ok = 0
     for i, e in enumerate(entries, 1):
         c = live.get(addresses.get(i - 1))
@@ -1292,11 +1422,8 @@ def report(entries, addresses):
         if e.get("group"):
             if not gkey:
                 problems.append("not in a group")
-            else:
-                if gindex != e["group_index"]:
-                    problems.append(f"tab {gindex + 1}, wanted {e['group_index'] + 1}")
-                if gactive != bool(e.get("group_active")):
-                    problems.append("wrong tab showing" if not gactive else "should not show")
+            elif tab_problems.get(e["group"]):
+                problems.append(tab_problems[e["group"]])
         elif gkey:
             problems.append("unexpectedly grouped")
         want_rect = saved_rect(e)
@@ -1374,12 +1501,18 @@ def main():
     r.add_argument("--spill", metavar="WS",
                    help="move windows on this layout's workspaces that are not part "
                         "of it to WS first, so they cannot split the arrangement")
+    r.add_argument("--tuck", action="store_true",
+                   help="fold windows not in this layout into the top-left tile "
+                        "instead of moving them away")
     r.set_defaults(func=cmd_restore, verify=True)
 
     sp = sub.add_parser("spill", help="send the focused window elsewhere")
     sp.add_argument("--workspace", help=f"workspace to send it to "
                                         f"(default {SPILL_WORKSPACE})")
     sp.set_defaults(func=cmd_spill)
+
+    tk = sub.add_parser("tuck", help="fold the focused window into the layout")
+    tk.set_defaults(func=cmd_tuck)
 
     sh = sub.add_parser("show", help="print the saved layout")
     sh.set_defaults(func=cmd_show)
@@ -1394,6 +1527,8 @@ def main():
         args.file = named_path(args.name)
     if getattr(args, "pick", False) and args.file != LAYOUT:
         ap.error("--pick chooses the layout itself — drop --name/--file")
+    if getattr(args, "spill", None) and getattr(args, "tuck", False):
+        ap.error("--spill moves strays away and --tuck folds them in — pick one")
     if getattr(args, "no_verify", False):
         args.verify = False
     SOCKET_DIR = instance_dir()

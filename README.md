@@ -124,17 +124,20 @@ Menu: **Layouts… → Go back to an earlier save…**
 
 Anything else on a layout's workspace is a tile the saved tree knows nothing about, and it splits the arrangement — a fifth tile in a 2×2 halves everything. That is what happens when something opens a window while you are working: it lands in the layout and pushes the rest aside.
 
-So a replay can clear them out first, and the focused window can be sent away on a key:
+So a replay can clear them out first, or fold them in, and the focused window can be dealt with on a key:
 
 ```bash
 hypr-layout restore --spill 5      # strays go to ws5, then the layout is rebuilt
+hypr-layout restore --tuck         # strays become tabs in the top-left tile instead
 hypr-layout spill                  # send the focused window to ws5
-hypr-layout spill --workspace 9    # ...or wherever you keep them
+hypr-layout tuck                   # fold the focused window into the layout
 ```
 
-The default for both is workspace 5.
+The default spill workspace is 5, and `--workspace N` moves it.
 
-Nothing is closed: a stray is moved to another workspace, where it carries on running.
+**Tucking** keeps the window where you are: it becomes a tab in the top-left tile — a tab costs no space, so the tile keeps its rectangle and the arrangement is untouched — and if that tile is not a group (nothing to join), it floats over that corner instead, which also keeps it out of the tiling tree. Tab numbers are no longer compared literally, because a tucked tab shifts every index after it, and that is not the layout being wrong.
+
+Nothing is closed either way: a stray is moved or tucked, never killed.
 
 ## Launch-or-focus
 
