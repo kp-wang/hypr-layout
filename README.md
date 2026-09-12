@@ -132,6 +132,8 @@ hypr-layout spill                  # send the focused window to ws5
 hypr-layout spill --workspace 9    # ...or wherever you keep them
 ```
 
+The default for both is workspace 5.
+
 Nothing is closed: a stray is moved to another workspace, where it carries on running.
 
 ## Launch-or-focus
