@@ -1,5 +1,7 @@
 # hypr-layout
 
+![two tiles drift away, one command brings the session back](docs/demo.gif)
+
 Save your Hyprland session and get it back — windows, workspaces, tab groups **and the arrangement they were in**.
 
 Three commands:
@@ -114,6 +116,12 @@ o.launch_on_start("bash -c 'sleep 8; echo \"=== $(date -Is) ===\"; ~/.local/bin/
 ```
 
 The sleep lets the session settle, and the log is there because a login-time replay has nowhere to print.
+
+## Where it fits
+
+Omarchy's compositor gives you tiling, groups and workspaces; what no session
+manager does out of the box is put a *specific arrangement* back after a reboot
+or a reshuffle. This is a small tool for that one job.
 
 ## How it works
 

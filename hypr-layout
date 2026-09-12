@@ -462,6 +462,12 @@ def place(entry, address):
         if at:
             dispatch(f'hl.dsp.window.move({{ x = {int(at[0])}, y = {int(at[1])}, '
                      f'window = "address:{address}" }})')
+    elif client.get("floating"):
+        # A window that drifted into floating is invisible to the tiling tree,
+        # so every preselect insert built on top of it silently does nothing
+        # and the arrangement comes out as strips. Put it back in the tiling.
+        dispatch(f'hl.dsp.window.float({{ action = "disable", '
+                 f'window = "address:{address}" }})')
     return workspace_of(by_address(address) or {}) == str(entry["workspace"])
 
 
