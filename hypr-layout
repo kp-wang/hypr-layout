@@ -33,7 +33,8 @@ How the replay works (and why it is not flaky):
 Named layouts live in ~/.config/hypr/layouts/, so a keybinding can offer a
 choice instead of being wired to one file:
 
-  hypr-layout restore --pick             menu: which layout, then which workspace
+  hypr-layout restore --pick             menu: which workspace (and which layout,
+                                         when more than one is saved)
   hypr-layout save --pick                menu: name this layout
   hypr-layout restore --name work        straight to a named layout
   hypr-layout restore --history          back to one of the last few saves
@@ -393,13 +394,16 @@ def ws_sort_key(ws):
 def pick_layout():
     """Which saved layout? Returns (name, path).
 
-    The question is always asked, even when only one layout is saved: the
-    picker exists to answer "which one?", and a silent skip makes the next
-    question ("which workspace?") look like it came from nowhere.
+    With only one layout saved the question answers itself, so it is skipped —
+    the workspace question that follows now explains its own rows. With two or
+    more, it is always asked: that is what --pick is for.
     """
     saved = all_layouts()
     if not saved:
         sys.exit("hypr-layout: nothing saved yet — run `hypr-layout save` first")
+    if len(saved) == 1:
+        name, path, _ = saved[0]
+        return name, path
     rows = []
     for name, path, layout in saved:
         n = len(layout.get("entries", []))
