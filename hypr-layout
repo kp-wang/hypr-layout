@@ -1,0 +1,917 @@
+#!/usr/bin/env python3
+"""hypr-layout — snapshot and replay the Hyprland window layout.
+
+Reopening a work setup by hand is: launch app, launch app, launch app, then
+drag them where they go. Tiling order IS the layout, so replaying the same apps
+into the same workspaces rebuilds it.
+
+How the replay works (and why it is not flaky):
+
+  * apps are launched **in parallel** — no per-window sleeping;
+  * every window is placed by its **address**, the moment Hyprland announces
+    it on the event socket — never by guessing from a window rule, which
+    silently fails for apps that hand off to an already-running instance;
+  * anything that acts on "the active window" (grouping) is preceded by a
+    **verified focus**, because Hyprland happily applies those to whatever
+    happens to be focused if the focus silently fails;
+  * the **arrangement** — which window is left, top or bottom — is rebuilt
+    from the rectangles the save recorded, by re-inserting the tiles in tree
+    order (`layout preselect` + move), because a dwindle tree cannot be set
+    directly but can be built;
+  * the result is read back and reported per entry.
+
+  hypr-layout save       snapshot what is on screen right now -> layout.json
+  hypr-layout restore    relaunch everything from the snapshot
+  hypr-layout show       print the saved snapshot
+
+Restore can be pointed at other workspaces without touching the snapshot:
+
+  hypr-layout restore --workspace 3                  every window on workspace 3
+  hypr-layout restore --workspace-map 'firefox=2'    per-class override
+  hypr-layout restore --workspace 3 --workspace-map 'obs=4'
+                                                     base workspace, class wins
+
+Edit layout.json by hand if you want a different tiling order — it is a plain
+list, and restore plays it top to bottom.
+"""
+import argparse
+import json
+import os
+import queue
+import select
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+from collections import defaultdict
+
+LAYOUT = os.path.expanduser("~/.config/hypr/layout.json")
+HOME = os.path.expanduser("~")
+# Never replayed: transient or WM-internal surfaces.
+SKIP_CLASSES = {"hyprland", "xwaylandvideobridge"}
+
+
+# ── Hyprland connection ──────────────────────────────────────────────────────
+# One unix socket for commands (~0.1 ms) instead of spawning hyprctl (~15 ms
+# each). This is what makes a replay fast enough to feel instant.
+
+def instance_dir():
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    runtime = f"/run/user/{os.getuid()}/hypr"
+    if sig and os.path.exists(f"{runtime}/{sig}/.socket.sock"):
+        return f"{runtime}/{sig}"
+    for name in sorted(os.listdir(runtime)) if os.path.isdir(runtime) else []:
+        if os.path.exists(f"{runtime}/{name}/.socket.sock"):
+            return f"{runtime}/{name}"
+    sys.exit("hypr-layout: no running Hyprland instance found")
+
+
+SOCKET_DIR = None
+
+
+def sock_command(command, timeout=5.0):
+    """Send one command to the compositor and return its reply."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(f"{SOCKET_DIR}/.socket.sock")
+        s.sendall(command.encode())
+        s.shutdown(socket.SHUT_WR)
+        chunks = []
+        while True:
+            try:
+                chunk = s.recv(1 << 20)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks).decode()
+    finally:
+        s.close()
+
+
+def dispatch(lua):
+    """Hyprland 0.56 on Omarchy parses `dispatch` as Lua."""
+    reply = sock_command(f"dispatch {lua}").strip()
+    if reply.startswith("error") or "invalid" in reply.lower():
+        return reply
+    return reply
+
+
+def clients():
+    return json.loads(sock_command("j/clients"))
+
+
+def by_address(addr):
+    return next((c for c in clients() if c.get("address") == addr), None)
+
+
+def active_address():
+    return json.loads(sock_command("j/activewindow")).get("address")
+
+
+class Events:
+    """Live stream of compositor events (openwindow, closewindow, …)."""
+
+    def __init__(self):
+        self.queue = queue.Queue()
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(f"{SOCKET_DIR}/.socket2.sock")
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        buf = b""
+        while True:
+            try:
+                chunk = self.sock.recv(65536)
+            except OSError:
+                return
+            if not chunk:
+                return
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                name, _, data = line.decode(errors="replace").partition(">>")
+                self.queue.put((name, data))
+
+    def next(self, deadline, want=("openwindow",)):
+        """Wait for an event of interest; returns (name, data) or None."""
+        while True:
+            left = deadline - time.time()
+            if left <= 0:
+                return None
+            try:
+                name, data = self.queue.get(timeout=min(left, 0.25))
+            except queue.Empty:
+                continue
+            if name in want:
+                return name, data
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def auto_group():
+    return "true" in sock_command("getoption group:auto_group")
+
+
+def set_auto_group(enabled):
+    """Hyprland 0.56 here uses a Lua config parser: `keyword` is refused and
+    the option has to be set through `eval`."""
+    value = "true" if enabled else "false"
+    reply = sock_command(f'eval hl.config({{ group = {{ auto_group = {value} }} }})').strip()
+    if reply and reply != "ok":
+        print(f"  warning: could not set group:auto_group — {reply[:80]}")
+
+
+def focus_checked(address, tries=4):
+    """Focus a window and confirm it actually got the focus.
+
+    Grouping dispatchers act on "the active window". A focus that silently
+    fails means the next dispatch hits an unrelated window — which is how a
+    replay can scramble a layout instead of rebuilding it.
+    """
+    for _ in range(tries):
+        current = by_address(address)
+        if current is None:
+            return False
+        # Focus only works across workspaces when the workspace is current.
+        if sock_command("activeworkspace").split()[2] != workspace_of(current):
+            dispatch(f'hl.dsp.workspace({{ workspace = "{workspace_of(current)}" }})')
+            time.sleep(0.05)
+        dispatch(f'hl.dsp.focus({{ window = "address:{address}" }})')
+        if active_address() == address:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+# ── capture ──────────────────────────────────────────────────────────────────
+
+def client_cmd(pid):
+    """Best-effort relaunch command for a window, from its process."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            argv = [a.decode() for a in fh.read().split(b"\0") if a]
+    except OSError:
+        argv = []
+    if not argv:
+        try:
+            argv = [os.readlink(f"/proc/{pid}/exe")]
+        except OSError:
+            return None, None
+    try:
+        cwd = os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        cwd = None
+    return argv, cwd
+
+
+def workspace_of(client):
+    ws = client.get("workspace") or {}
+    return ws.get("name") or str(ws.get("id", 1))
+
+
+def group_of(client):
+    """(group key, tab index, is visible tab) — key is None when ungrouped."""
+    members = client.get("grouped") or []
+    if not members:
+        return None, 0, False
+    addr = client.get("address")
+    return members[0], members.index(addr) if addr in members else 0, bool(client.get("visible"))
+
+
+def sanitize(cls, argv, cwd, title=""):
+    """Fix up argv that only made sense in the session it was captured from."""
+    # Zed hands its launcher a one-shot IPC socket that is gone by replay time.
+    argv = [a for a in argv if not a.startswith("zed-cli://")]
+    # Nautilus in service mode registers a daemon instead of opening a window;
+    # its window title is the folder it was showing.
+    if cls.endswith("Nautilus"):
+        target = title if title and os.path.isdir(os.path.expanduser(title)) else cwd
+        return ["nautilus"] + ([target] if target and target != HOME else [])
+    return argv
+
+
+def cmd_save(args):
+    layout_monitors = json.loads(sock_command("j/monitors"))
+    entries, skipped = [], []
+    for c in clients():
+        cls = c.get("class") or c.get("initialClass") or "?"
+        if cls in SKIP_CLASSES:
+            skipped.append(f"{cls}: internal")
+            continue
+        if c.get("floating") and not args.floating:
+            skipped.append(f"{cls}: floating")
+            continue
+        if c.get("hidden"):
+            skipped.append(f"{cls}: hidden")
+            continue
+        argv, cwd = client_cmd(c.get("pid", 0))
+        if not argv:
+            skipped.append(f"{cls}: no cmdline")
+            continue
+        gkey, gindex, gactive = group_of(c)
+        entries.append({
+            "class": cls,
+            "title": (c.get("title") or "")[:80],
+            "workspace": workspace_of(c),
+            "floating": bool(c.get("floating")),
+            "at": c.get("at"),
+            "size": c.get("size"),
+            "cmd": sanitize(cls, argv, cwd, c.get("title") or ""),
+            "cwd": cwd,
+            "group": gkey,
+            "group_index": gindex,
+            "group_active": gactive,
+        })
+
+    layout = {
+        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "monitors": [{"name": m["name"], "mode": f"{m['width']}x{m['height']}@"
+                      f"{round(m['refreshRate'])}", "scale": m.get("scale", 1)}
+                     for m in layout_monitors],
+        "entries": entries,
+    }
+    if os.path.exists(args.file):  # keep the previous save around
+        shutil.copy2(args.file, args.file + ".bak")
+    with open(args.file, "w") as fh:
+        json.dump(layout, fh, indent=2)
+    print(f"saved {len(entries)} windows -> {args.file}")
+    for e in entries:
+        tab = f" [group tab {e['group_index'] + 1}{'*' if e['group_active'] else ''}]" \
+            if e["group"] else ""
+        print(f"  ws{e['workspace']:<8} {e['class']:<18} {e['title'][:44]}{tab}")
+    groups = {e["group"] for e in entries if e["group"]}
+    if groups:
+        print(f"  ({len(groups)} window group(s) captured — '*' marks the visible tab)")
+    for s in skipped:
+        print(f"  skipped  {s}")
+    print("\nedit the entries list to change tiling order; restore replays top to bottom.")
+
+
+def cmd_show(args):
+    with open(args.file) as fh:
+        layout = json.load(fh)
+    print(f"{args.file}  (saved {layout['saved_at']})")
+    for e in layout["entries"]:
+        tab = f" [tab {e['group_index'] + 1}{'*' if e.get('group_active') else ''}]" \
+            if e.get("group") else ""
+        print(f"  ws{e['workspace']:<8} {e['class']:<18} {e['title'][:44]}{tab}")
+
+
+# ── replay ───────────────────────────────────────────────────────────────────
+
+def order_for_launch(entries):
+    """Keep a group's members back to back, so they are merged in one run."""
+    out, done = [], set()
+    for e in entries:
+        g = e.get("group")
+        if not g:
+            out.append(e)
+        elif g not in done:
+            done.add(g)
+            out.extend(x for x in entries if x.get("group") == g)
+    return out
+
+
+def parse_workspace_map(spec):
+    """'firefox=2,obs:3' or 'firefox=2,obs=3' -> {'firefox': '2', 'obs': '3'}."""
+    mapping = {}
+    for pair in spec.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        for sep in ("=", ":"):
+            if sep in pair:
+                cls, _, ws = pair.partition(sep)
+                break
+        else:
+            sys.exit(f"--workspace-map: '{pair}' is not 'class=workspace'")
+        cls, ws = cls.strip(), ws.strip()
+        if not cls or not ws:
+            sys.exit(f"--workspace-map: '{pair}' is not 'class=workspace'")
+        mapping[cls] = ws
+    return mapping
+
+
+def apply_workspace_overrides(entries, global_ws, mapping):
+    """Move entries to the requested workspaces before anything is launched.
+
+    `--workspace` sets the base for every window, then `--workspace-map`
+    overrides per class.
+    """
+    for e in entries:
+        if global_ws:
+            e["workspace"] = global_ws
+        wanted = mapping.get(e["class"])
+        if wanted is None:  # tolerate case differences in the class name
+            wanted = next((ws for cls, ws in mapping.items()
+                           if cls.lower() == e["class"].lower()), None)
+        if wanted:
+            e["workspace"] = wanted
+
+    unknown = [cls for cls in mapping
+               if not any(cls.lower() == e["class"].lower() for e in entries)]
+    for cls in unknown:
+        print(f"  warning: --workspace-map has '{cls}', no such window in the layout")
+
+    # A group only exists inside one workspace, so a split group cannot be built.
+    for gid in {e["group"] for e in entries if e.get("group")}:
+        members = [e for e in entries if e.get("group") == gid]
+        spaces = {e["workspace"] for e in members}
+        if len(spaces) > 1:
+            names = ", ".join(f"{e['class']}→ws{e['workspace']}" for e in members)
+            print(f"  warning: group split across workspaces ({names}) — "
+                  "those windows will not be grouped")
+            for e in members:
+                e["group"] = None
+
+
+def existing_pool(force):
+    """Class -> open windows, for launch-or-focus reuse.
+
+    Reuse is a judgement call: several windows share a class (every terminal is
+    `foot`), and grabbing the wrong one drags an unrelated window across the
+    layout. Candidates are scored on title, workspace and group membership
+    instead of taking whichever one happens to be first.
+    """
+    pool = defaultdict(list)
+    if not force:
+        for c in clients():
+            pool[(c.get("class") or "?")].append(c)
+    return pool
+
+
+def take_existing(pool, entry):
+    """Best reuse candidate for this entry, or None to launch a new window."""
+    candidates = pool.get(entry["class"])
+    if not candidates:
+        return None
+
+    def score(c):
+        points = 0
+        title = (entry.get("title") or "").strip()
+        live = (c.get("title") or "").strip()
+        if title and live == title:
+            points += 4
+        elif title and live[:12] == title[:12]:
+            points += 2
+        if workspace_of(c) == str(entry["workspace"]):
+            points += 2
+        if bool(c.get("grouped")) == bool(entry.get("group")):
+            points += 1
+        return points
+
+    best = max(candidates, key=score)
+    candidates.remove(best)
+    return best
+
+
+def spawn(entry):
+    """Start the app, detached from this process."""
+    argv = entry["cmd"]
+    cwd = entry.get("cwd")
+    if cwd and cwd != HOME and not os.path.isdir(cwd):
+        cwd = None
+    try:
+        return subprocess.Popen(
+            argv, cwd=cwd, start_new_session=True,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, env=os.environ.copy())
+    except OSError as exc:
+        print(f"  warning: cannot launch {argv[0]}: {exc}")
+        return None
+
+
+def place(entry, address):
+    """Put a window on its workspace (and float/resize it if the save says so)."""
+    client = by_address(address)
+    if client is None:
+        return False
+    if workspace_of(client) != str(entry["workspace"]):
+        dispatch(f'hl.dsp.window.move({{ workspace = "{entry["workspace"]}", '
+                 f'follow = false, window = "address:{address}" }})')
+    if entry.get("floating"):
+        dispatch(f'hl.dsp.window.float({{ action = "enable", '
+                 f'window = "address:{address}" }})')
+        size, at = entry.get("size"), entry.get("at")
+        if size:
+            dispatch(f'hl.dsp.window.resize({{ x = {int(size[0])}, y = {int(size[1])}, '
+                     f'window = "address:{address}" }})')
+        if at:
+            dispatch(f'hl.dsp.window.move({{ x = {int(at[0])}, y = {int(at[1])}, '
+                     f'window = "address:{address}" }})')
+    return workspace_of(by_address(address) or {}) == str(entry["workspace"])
+
+
+def launch_all(entries, stagger):
+    """Launch every entry that has no window yet; return address per entry.
+
+    Apps start in parallel and windows are picked up from the event stream as
+    Hyprland announces them, so the whole replay takes about as long as the
+    slowest app needs to open.
+    """
+    events = Events()
+    pending = {}           # pid -> entry index
+    pids = {}
+    for i, e in enumerate(entries):
+        proc = spawn(e)
+        if proc:
+            pids[i] = proc.pid
+            pending[proc.pid] = i
+        if stagger:
+            time.sleep(stagger)
+
+    addresses = {}
+    unclaimed = set(range(len(entries)))   # entry indexes still waiting
+    by_class = defaultdict(list)           # class -> waiting entry indexes
+    for i in unclaimed:
+        by_class[entries[i]["class"]].append(i)
+
+    deadline = time.time() + max(20.0, 10.0 + 3.0 * len(entries))
+    while unclaimed and time.time() < deadline:
+        event = events.next(deadline)
+        if event is None:
+            break
+        _, data = event
+        fields = data.split(",")
+        if len(fields) < 3:
+            continue
+        address, cls = fields[0], fields[2]
+        address = address if address.startswith("0x") else f"0x{address}"
+        client = by_address(address)
+        if client is None:
+            continue
+
+        # Match the window to the entry that produced it, best evidence first:
+        # the process we started, then the class we asked for, then — if a
+        # single entry is still waiting — the only window that opened after we
+        # launched it (apps like Firefox hand the window to another process).
+        idx = pending.get(client.get("pid"))
+        if idx is not None and idx not in unclaimed:
+            idx = None
+        if idx is None:
+            waiting = [j for j in by_class.get(cls, []) if j in unclaimed]
+            idx = waiting[0] if waiting else None
+        if idx is None and len(unclaimed) == 1:
+            idx = next(iter(unclaimed))
+        if idx is None:
+            continue      # not ours — leave it alone
+
+        unclaimed.discard(idx)
+        for lst in by_class.values():
+            if idx in lst:
+                lst.remove(idx)
+        place(entries[idx], address)
+        addresses[idx] = address
+    events.close()
+    return addresses
+
+
+def group_matches(entries, addresses):
+    """True when these windows already form the saved group, tab for tab."""
+    live = [by_address(a) for a in addresses if a]
+    if len(live) != len(entries) or any(c is None for c in live):
+        return False
+    keys = {(c.get("grouped") or [None])[0] for c in live}
+    if len(keys) != 1 or None in keys:
+        return False
+    for e, c in zip(entries, live):
+        _, index, visible = group_of(c)
+        if index != e["group_index"] or visible != bool(e.get("group_active")):
+            return False
+    return True
+
+
+def build_group(entries, addresses):
+    """Form one window group from windows that are already placed."""
+    members = [(e, a) for e, a in zip(entries, addresses) if a and by_address(a)]
+    if len(members) < 2:
+        return
+    anchor = members[0][1]
+    if not focus_checked(anchor):
+        print(f"  FAIL group: cannot focus {entries[0]['class']}")
+        return
+    if (by_address(anchor) or {}).get("grouped"):
+        dispatch("hl.dsp.window.move({ out_of_group = true })")
+        time.sleep(0.1)
+    dispatch("hl.dsp.group.toggle()")
+
+    for e, addr in members[1:]:
+        merged = False
+        for attempt in range(2):
+            if not focus_checked(addr):
+                break
+            # Re-inserting next to the anchor makes the two neighbours in the
+            # tiling tree, which is what `into_group` needs.
+            if attempt:
+                dispatch(f'hl.dsp.window.move({{ workspace = "{e["workspace"]}", '
+                         f'follow = false, window = "address:{addr}" }})')
+                focus_checked(anchor)
+                focus_checked(addr)
+            for direction in ("l", "r", "u", "d"):
+                dispatch(f'hl.dsp.window.move({{ into_group = "{direction}" }})')
+                time.sleep(0.05)
+                if anchor in ((by_address(addr) or {}).get("grouped") or []):
+                    merged = True
+                    break
+            if merged:
+                break
+        if not merged:
+            print(f"  warning: could not merge {e['class']} into the group")
+
+    visible = next((a for e, a in members if e.get("group_active")), members[0][1])
+    focus_checked(visible)
+    ok = all(anchor in ((by_address(a) or {}).get("grouped") or []) for _, a in members[1:])
+    label = ", ".join(e["class"] for e, _ in members)
+    print(f"  {'OK  ' if ok else 'FAIL'} group of {len(members)}: {label}")
+
+
+# ── arrangement ──────────────────────────────────────────────────────────────
+# Workspace and group membership are not the layout. Which window sits left,
+# top or bottom comes from the dwindle tree, and a tree cannot be set directly
+# — but it can be built: with a window focused, `layout preselect <side>` makes
+# the next window to arrive split that window's rect on that side. So a saved
+# arrangement is rebuilt by re-inserting the tiles in tree order, deriving the
+# tree from the rectangles the save recorded.
+
+TOL = 6                      # px of slack when comparing rectangles
+SCRATCH = "special:hypr-layout"
+
+
+def saved_rect(entry):
+    if not entry.get("at") or not entry.get("size"):
+        return None
+    return (entry["at"][0], entry["at"][1], entry["size"][0], entry["size"][1])
+
+
+def rect_of(client):
+    return (*client["at"], *client["size"])
+
+
+def rect_close(a, b, tol=TOL):
+    return all(abs(x - y) <= tol for x, y in zip(a, b))
+
+
+def _bbox(rects):
+    x0 = min(r[0] for r in rects)
+    y0 = min(r[1] for r in rects)
+    return (x0, y0, max(r[0] + r[2] for r in rects) - x0,
+            max(r[1] + r[3] for r in rects) - y0)
+
+
+def arrange_tree(indexed):
+    """Recover the dwindle tree from rectangles that tile a box.
+
+    A leaf is {"index": n}; a split is {"split", "ratio", "first", "second"}
+    where `first` is the left/top child — the side the ratio counts from.
+    Tiles are separated by gaps and borders, never flush, so a split is
+    detected as "everything in this group ends before that group starts".
+    """
+    if len(indexed) == 1:
+        return {"index": indexed[0][1]}
+    for axis in ("v", "h"):
+        start, extent = (0, 2) if axis == "v" else (1, 3)
+        ordered = sorted(indexed, key=lambda it: it[0][start])
+        for k in range(1, len(ordered)):
+            head, tail = ordered[:k], ordered[k:]
+            if max(r[start] + r[extent] for r, _ in head) > min(r[start] for r, _ in tail):
+                continue                      # they overlap on this axis
+            hb = _bbox([r for r, _ in head])
+            tb = _bbox([r for r, _ in tail])
+            if hb[extent] == 0 or tb[extent] == 0:
+                continue
+            ratio = hb[extent] / (hb[extent] + tb[extent])
+            return {"split": axis, "ratio": ratio,
+                    "first": arrange_tree(head), "second": arrange_tree(tail)}
+    return {"index": indexed[0][1]}
+
+
+def leftmost(node):
+    while "index" not in node:
+        node = node["first"]
+    return node["index"]
+
+
+def tiles_of(entries, addresses):
+    """Entries collapsed into tiles — a window group tiles as a single unit."""
+    out = []
+    for i, e in enumerate(entries):
+        if not addresses.get(i):
+            continue
+        key = e.get("group") or f"entry{i}"
+        tile = next((t for t in out if t["key"] == key), None)
+        if tile is None:
+            tile = {"key": key, "indexes": [], "rect": saved_rect(e)}
+            out.append(tile)
+        tile["indexes"].append(i)
+    return out
+
+
+def tile_rep(tile, addresses):
+    """Address standing for the tile: a group moves as one unit with it."""
+    live = [c for c in (by_address(addresses[i]) for i in tile["indexes"] if addresses.get(i))
+            if c]
+    if not live:
+        return None
+    return next((c["address"] for c in live if c.get("visible")), live[0]["address"])
+
+
+def move_tile(address, workspace):
+    return dispatch(f'hl.dsp.window.move({{ workspace = "{workspace}", follow = false, '
+                    f'window = "address:{address}" }})')
+
+
+def arrange(entries, addresses, workspace):
+    """Rebuild one workspace's tiling so the tiles land in their saved rects."""
+    tiles = [t for t in tiles_of(entries, addresses) if t["rect"]]
+    if len(tiles) < 2 or not all(tile_rep(t, addresses) for t in tiles):
+        return
+    tree = arrange_tree([(t["rect"], n) for n, t in enumerate(tiles)])
+
+    # Park every tile off the workspace first: an empty workspace has no tree,
+    # and the build below needs to start from nothing.
+    for tile in tiles:
+        move_tile(tile_rep(tile, addresses), SCRATCH)
+        time.sleep(0.08)
+
+    def insert(index, anchor, side):
+        tile = tiles[index]
+        if anchor is not None:
+            if not focus_checked(anchor):     # preselect applies to the focused window
+                return None
+            dispatch(f'hl.dsp.layout("preselect {side}")')
+        move_tile(tile_rep(tile, addresses), workspace)
+        time.sleep(0.12)
+        return tile_rep(tile, addresses)
+
+    def expand(node, owner):
+        if "index" in node:
+            return
+        side = "r" if node["split"] == "v" else "d"
+        second_owner = insert(leftmost(node["second"]), owner, side)
+        if second_owner and abs(node["ratio"] - 0.5) > 0.04 and focus_checked(owner):
+            dispatch(f'hl.dsp.layout("splitratio {node["ratio"]:.3f}")')
+            time.sleep(0.08)
+        expand(node["first"], owner)
+        if second_owner:
+            expand(node["second"], second_owner)
+
+    owner = insert(leftmost(tree), None, None)
+    if owner:
+        expand(tree, owner)
+
+    # Never leave a window parked: anything that missed the workspace goes back.
+    for tile in tiles:
+        rep = tile_rep(tile, addresses)
+        live = by_address(rep) if rep else None
+        if live and workspace_of(live) != str(workspace):
+            move_tile(rep, workspace)
+
+
+def cmd_restore(args):
+    with open(args.file) as fh:
+        layout = json.load(fh)
+    entries = layout["entries"]
+    if args.except_:
+        entries = [e for e in entries if e["class"] not in args.except_]
+
+    mapping = parse_workspace_map(args.workspace_map) if args.workspace_map else {}
+    if args.workspace or mapping:
+        apply_workspace_overrides(entries, str(args.workspace) if args.workspace else None,
+                                  mapping)
+
+    if args.dry_run:
+        pool = existing_pool(args.force)
+        reused = 0
+        print(f"would replay {len(entries)} windows from {args.file}:")
+        for i, e in enumerate(entries, 1):
+            tab = f" [tab {e['group_index'] + 1}]" if e.get("group") else ""
+            have = take_existing(pool, e)
+            reused += 1 if have else 0
+            note = "  (focus the open window)" if have else ""
+            print(f"  {i:2}. ws{e['workspace']:<6} {e['class']:<18} "
+                  f"{' '.join(e['cmd'])[:52]}{tab}{note}")
+        if reused:
+            print(f"\n{reused} of {len(entries)} would focus a window that is already "
+                  "open; --force launches new copies instead")
+        if any(e.get("group") for e in entries):
+            print("window groups would be rebuilt after all apps are up")
+        return
+
+    entries = order_for_launch(entries)
+    grouping = any(e.get("group") for e in entries) and not args.no_groups
+
+    started = time.time()
+    print(f"replaying {len(entries)} windows")
+    was_auto = auto_group() if grouping else False
+    if grouping and was_auto:
+        # Otherwise apps launched while a grouped window has focus join that
+        # group on their own and land in the wrong tab.
+        set_auto_group(False)
+
+    # Snapshot what is already open so an entry can focus an existing window
+    # instead of starting a second copy (the Omarchy launch-or-focus idiom).
+    pool = existing_pool(args.force)
+
+    addresses, reused_flags, to_launch = {}, set(), []
+    for i, e in enumerate(entries):
+        existing = take_existing(pool, e)
+        if existing:
+            reused_flags.add(i)
+            place(e, existing["address"])
+            addresses[i] = existing["address"]
+            print(f"  {i + 1:2}. ws{e['workspace']:<6} {e['class']:<18} "
+                  "(focused the window already open)")
+        else:
+            to_launch.append(i)
+
+    try:
+        if to_launch:
+            launched = launch_all([entries[i] for i in to_launch], args.delay)
+            for slot, i in enumerate(to_launch):
+                addr = launched.get(slot)
+                addresses[i] = addr
+                e = entries[i]
+                print(f"  {i + 1:2}. ws{e['workspace']:<6} {e['class']:<18} "
+                      f"{' '.join(e['cmd'])[:52]}"
+                      f"{'' if addr else '  (no window appeared)'}")
+        if grouping:
+            for gid in dict.fromkeys(e.get("group") for e in entries if e.get("group")):
+                idxs = [i for i, e in enumerate(entries) if e.get("group") == gid]
+                idxs.sort(key=lambda i: entries[i]["group_index"])  # tab order
+                group_entries = [entries[i] for i in idxs]
+                group_addrs = [addresses.get(i) for i in idxs]
+                # A group that already matches the save is left alone: tearing
+                # a correct group down and rebuilding it only adds ways to fail.
+                if group_matches(group_entries, group_addrs):
+                    print(f"  OK   group of {len(idxs)}: "
+                          f"{', '.join(e['class'] for e in group_entries)} (already correct)")
+                else:
+                    build_group(group_entries, group_addrs)
+        if not args.no_arrange:
+            for ws in dict.fromkeys(str(e["workspace"]) for e in entries):
+                idxs = [i for i, e in enumerate(entries) if str(e["workspace"]) == ws]
+                arrange([entries[i] for i in idxs],
+                        {n: addresses.get(i) for n, i in enumerate(idxs)}, ws)
+
+    finally:
+        if grouping and was_auto:
+            set_auto_group(True)
+
+    ok, total = report(entries, addresses)
+    print(f"{ok}/{total} windows placed correctly  ({time.time() - started:.1f}s)")
+    if args.verify:
+        verify(entries)
+
+
+def report(entries, addresses):
+    """Per-entry check of workspace / tiling / tab, straight from the compositor."""
+    live = {c.get("address"): c for c in clients()}
+    ok = 0
+    for i, e in enumerate(entries, 1):
+        c = live.get(addresses.get(i - 1))
+        if c is None:
+            print(f"  FAIL {i:2}. {e['class']:<18} no window")
+            continue
+        problems = []
+        if workspace_of(c) != str(e["workspace"]):
+            problems.append(f"on ws{workspace_of(c)}, wanted ws{e['workspace']}")
+        if bool(c.get("floating")) != bool(e.get("floating")):
+            problems.append("floating" if e.get("floating") else "tiled")
+        gkey, gindex, gactive = group_of(c)
+        if e.get("group"):
+            if not gkey:
+                problems.append("not in a group")
+            else:
+                if gindex != e["group_index"]:
+                    problems.append(f"tab {gindex + 1}, wanted {e['group_index'] + 1}")
+                if gactive != bool(e.get("group_active")):
+                    problems.append("wrong tab showing" if not gactive else "should not show")
+        elif gkey:
+            problems.append("unexpectedly grouped")
+        want_rect = saved_rect(e)
+        if want_rect and not e.get("floating") and not rect_close(rect_of(c), want_rect):
+            have = rect_of(c)
+            problems.append(f"arrangement {have[0]},{have[1]} {have[2]}x{have[3]} "
+                            f"wanted {want_rect[0]},{want_rect[1]} "
+                            f"{want_rect[2]}x{want_rect[3]}")
+        tab = f" [tab {gindex + 1}{'*' if gactive else ''}]" if gkey else ""
+        if problems:
+            print(f"  FAIL {i:2}. ws{e['workspace']:<6} {e['class']:<18}{tab} "
+                  f"{'; '.join(problems)}")
+        else:
+            ok += 1
+            print(f"  ok   {i:2}. ws{e['workspace']:<6} {e['class']:<18}{tab}")
+    return ok, len(entries)
+
+
+def verify(entries):
+    """Diff the live window set against the snapshot by class + workspace."""
+    from collections import Counter
+    have = Counter((c.get("class") or "?", workspace_of(c)) for c in clients())
+    want = Counter((e["class"], e["workspace"]) for e in entries)
+    missing = want - have
+    extra = have - want
+    if not missing and not extra:
+        print("snapshot matches the live session")
+        return
+    for (cls, ws), n in missing.items():
+        print(f"  missing: {n}x {cls} on ws{ws}")
+    for (cls, ws), n in extra.items():
+        print(f"  extra:   {n}x {cls} on ws{ws}")
+
+
+def main():
+    global SOCKET_DIR
+    ap = argparse.ArgumentParser(prog="hypr-layout", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-f", "--file", default=LAYOUT, help=f"layout file (default {LAYOUT})")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("save", help="snapshot the current layout")
+    s.add_argument("--floating", action="store_true",
+                   help="include floating windows (their size and position are saved)")
+    s.set_defaults(func=cmd_save)
+
+    r = sub.add_parser("restore", help="relaunch the saved layout")
+    r.add_argument("--dry-run", action="store_true",
+                   help="print what would happen, change nothing")
+    r.add_argument("--delay", type=float, default=0.0,
+                   help="seconds between app launches (default 0: all at once)")
+    r.add_argument("--except", dest="except_", action="append", default=[],
+                   help="class to skip, repeatable")
+    r.add_argument("--workspace", help="open every window on this workspace, e.g. 3")
+    r.add_argument("--workspace-map",
+                   help="per-class workspace, e.g. 'firefox=2,obs=3'")
+    r.add_argument("--no-groups", action="store_true",
+                   help="launch apps but skip rebuilding window groups")
+    r.add_argument("--force", action="store_true",
+                   help="always launch, even when a window of that class is "
+                        "already open (default: focus the existing one)")
+    r.add_argument("--no-arrange", action="store_true",
+                   help="keep the windows on the right workspaces but do not "
+                        "rebuild the tiling arrangement they were saved in")
+    r.add_argument("--no-verify", action="store_true",
+                   help="skip the final snapshot comparison")
+    r.set_defaults(func=cmd_restore, verify=True)
+
+    sh = sub.add_parser("show", help="print the saved layout")
+    sh.set_defaults(func=cmd_show)
+
+    args = ap.parse_args()
+    if getattr(args, "no_verify", False):
+        args.verify = False
+    SOCKET_DIR = instance_dir()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
