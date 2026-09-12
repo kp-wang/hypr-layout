@@ -23,8 +23,21 @@ Restoring a session sounds like "launch the same apps again". In practice four t
 
 ## Requirements
 
-- Hyprland, tested against **0.56.2** (Omarchy's Lua-config build).
-- Python 3.9+ — nothing to install, no third-party packages.
+- **Hyprland with the Lua dispatch API** — the `hl.dsp.*` dispatchers, as shipped by Omarchy
+  (tested on 0.56.2). On a classic-config Hyprland build those commands do not parse and
+  nothing will move. Check before installing:
+
+  ```bash
+  hyprctl dispatch 'hl.dsp.window.move({ workspace = "2" })'   # "ok" means you are set
+  ```
+
+- Python 3 — nothing to install, no third-party packages.
+
+Note that one dispatcher in particular is not dependable: `hl.dsp.workspace` answered `ok`
+and switched workspaces early in this tool's development, then later became a *table* and
+error'd out, in the same session. hypr-layout therefore never switches workspaces —
+`hl.dsp.focus` by window address crosses workspaces on its own — and every action it takes
+is verified by reading the compositor back rather than trusting an `ok`.
 
 ## Install
 
@@ -40,7 +53,7 @@ Make sure `~/.local/bin` is on your `PATH`.
 ## Usage
 
 ```bash
-hypr-layout save                    # snapshot -> ~/.config/hypr/layout.json
+hypr-layout save                    # snapshot -> ~/.config/hypr/layout.json  (do this first)
 hypr-layout restore                 # replay it
 hypr-layout restore --dry-run       # show what would happen, change nothing
 hypr-layout show                    # print the snapshot

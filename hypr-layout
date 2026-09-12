@@ -178,18 +178,33 @@ def focus_checked(address, tries=4):
     replay can scramble a layout instead of rebuilding it.
     """
     for _ in range(tries):
-        current = by_address(address)
-        if current is None:
+        if by_address(address) is None:
             return False
-        # Focus only works across workspaces when the workspace is current.
-        if sock_command("activeworkspace").split()[2] != workspace_of(current):
-            dispatch(f'hl.dsp.workspace({{ workspace = "{workspace_of(current)}" }})')
-            time.sleep(0.05)
+        # Focusing by address crosses workspaces on its own, so no workspace
+        # switch is needed — good, because `hl.dsp.workspace` is not dependable
+        # (on this build it is a table and errors out, while the same call
+        # worked earlier in the same session). The focus is read back below.
         dispatch(f'hl.dsp.focus({{ window = "address:{address}" }})')
         if active_address() == address:
             return True
         time.sleep(0.05)
     return False
+
+
+def load_layout(path):
+    """Read a snapshot, or explain what to do instead of raising."""
+    try:
+        with open(path) as fh:
+            layout = json.load(fh)
+    except FileNotFoundError:
+        sys.exit(f"hypr-layout: nothing saved at {path}\n"
+                 f"             run `hypr-layout save` to snapshot your current session")
+    except json.JSONDecodeError as exc:
+        sys.exit(f"hypr-layout: {path} is not valid JSON — {exc}")
+    if not layout.get("entries"):
+        sys.exit(f"hypr-layout: {path} has no windows in it\n"
+                 f"             run `hypr-layout save` while your session is open")
+    return layout
 
 
 # ── capture ──────────────────────────────────────────────────────────────────
@@ -297,8 +312,7 @@ def cmd_save(args):
 
 
 def cmd_show(args):
-    with open(args.file) as fh:
-        layout = json.load(fh)
+    layout = load_layout(args.file)
     print(f"{args.file}  (saved {layout['saved_at']})")
     for e in layout["entries"]:
         tab = f" [tab {e['group_index'] + 1}{'*' if e.get('group_active') else ''}]" \
@@ -717,8 +731,7 @@ def arrange(entries, addresses, workspace):
 
 
 def cmd_restore(args):
-    with open(args.file) as fh:
-        layout = json.load(fh)
+    layout = load_layout(args.file)
     entries = layout["entries"]
     if args.except_:
         entries = [e for e in entries if e["class"] not in args.except_]
