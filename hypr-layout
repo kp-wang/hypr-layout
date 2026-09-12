@@ -38,6 +38,11 @@ choice instead of being wired to one file:
   hypr-layout save --pick                menu: name this layout
   hypr-layout restore --name work        straight to a named layout
   hypr-layout restore --history          back to one of the last few saves
+  hypr-layout spill                      send the focused window to ws10
+
+`restore --spill WS` first moves any window on the layout's workspaces that is
+not part of it to WS: a stray window is a tile the saved tree knows nothing
+about, and it splits the arrangement.
 
 Every save keeps the few before it in ~/.config/hypr/layout-history/, so a save
 taken at a bad moment does not cost you the good one.
@@ -74,6 +79,7 @@ LAYOUT_DIR = os.path.expanduser("~/.config/hypr/layouts")
 LAYOUT_HISTORY = os.path.expanduser("~/.config/hypr/layout-history")
 HISTORY_KEEP = 5          # earlier saves kept per layout
 WORKSPACE_RANGE = 10      # numeric workspaces offered (Hyprland has no fixed count)
+SPILL_WORKSPACE = 10      # where `--spill` and `spill` park windows by default
 HOME = os.path.expanduser("~")
 # Never replayed: transient or WM-internal surfaces.
 SKIP_CLASSES = {"hyprland", "xwaylandvideobridge"}
@@ -602,6 +608,35 @@ def cmd_show(args):
 
 # ── replay ───────────────────────────────────────────────────────────────────
 
+def spill_strays(entries, addresses, target):
+    """Move windows on the layout's workspaces that are not part of it away.
+
+    Anything else on those workspaces is a tile the tree does not know about,
+    and it splits the arrangement — a fifth tile in a 2x2 halves everything.
+    Returns how many were moved.
+    """
+    known = {a for a in addresses.values() if a}
+    spaces = {str(e["workspace"]) for e in entries}
+    strays = [c for c in clients()
+              if workspace_of(c) in spaces and c["address"] not in known]
+    for c in strays:
+        dispatch(f'hl.dsp.window.move({{ workspace = "{target}", follow = false, '
+                 f'window = "address:{c["address"]}" }})')
+    return strays
+
+
+def cmd_spill(args):
+    """Send one window to another workspace, to keep a layout clear of strays."""
+    workspace = str(args.workspace or SPILL_WORKSPACE)
+    address = active_address()
+    client = by_address(address) if address else None
+    if client is None:
+        sys.exit("hypr-layout: no active window to move")
+    dispatch(f'hl.dsp.window.move({{ workspace = "{workspace}", follow = false, '
+             f'window = "address:{address}" }})')
+    print(f"moved {client['class']} to ws{workspace}")
+
+
 def cmd_layouts(args):
     saved = all_layouts()
     if not saved:
@@ -900,42 +935,38 @@ def build_group(entries, addresses):
 
     for e, addr in members[1:]:
         merged = False
-        for attempt in range(2):
-            if not focus_checked(addr):
-                break
-            # A window that is grouped with something else has to leave that
-            # group first, or it cannot be merged into this one — which is what
-            # happens when two same-class windows were paired the other way.
-            if (by_address(addr) or {}).get("grouped"):
-                dispatch("hl.dsp.window.move({ out_of_group = true })")
-                time.sleep(0.1)
-                focus_checked(addr)
-            # `into_group` only sees a group next door, so the member has to
-            # become a neighbour of the anchor first. A freshly launched window
-            # is somewhere else in the tree entirely, which is how a merge ends
-            # up failing on a window that is sitting right there: park it, then
-            # re-insert it against the anchor with `preselect`.
-            if attempt:
-                focus_checked(anchor)
-                dispatch(f'hl.dsp.window.move({{ workspace = "{SCRATCH}", '
-                         f'follow = false, window = "address:{addr}" }})')
-                time.sleep(0.08)
-                focus_checked(anchor)
-                dispatch('hl.dsp.layout("preselect r")')
-                dispatch(f'hl.dsp.window.move({{ workspace = "{e["workspace"]}", '
-                         f'follow = false, window = "address:{addr}" }})')
-                time.sleep(0.15)
-                focus_checked(addr)
+        if not focus_checked(addr):
+            warn(f"cannot focus {e['class']} to group it")
+            continue
+        # A window that is grouped with something else has to leave that group
+        # first, or it cannot be merged into this one.
+        if (by_address(addr) or {}).get("grouped"):
+            dispatch("hl.dsp.window.move({ out_of_group = true })")
+            time.sleep(0.1)
+        # Then make it a neighbour of the anchor, because `into_group` only
+        # sees a group next door. Parking and re-inserting it against the
+        # anchor with `preselect` is what guarantees that; trying the four
+        # directions from wherever the window happens to be instead can grab a
+        # *different* group that happens to be adjacent, which scrambles two
+        # tiles at once.
+        focus_checked(anchor)
+        dispatch(f'hl.dsp.window.move({{ workspace = "{SCRATCH}", follow = false, '
+                 f'window = "address:{addr}" }})')
+        time.sleep(0.1)
+        if focus_checked(anchor):
+            dispatch('hl.dsp.layout("preselect r")')
+        dispatch(f'hl.dsp.window.move({{ workspace = "{e["workspace"]}", '
+                 f'follow = false, window = "address:{addr}" }})')
+        time.sleep(0.2)
+        if focus_checked(addr):
             for direction in ("l", "r", "u", "d"):
                 dispatch(f'hl.dsp.window.move({{ into_group = "{direction}" }})')
-                time.sleep(0.05)
+                time.sleep(0.06)
                 if anchor in ((by_address(addr) or {}).get("grouped") or []):
                     merged = True
                     break
-            if merged:
-                break
         if not merged:
-            print(f"  warning: could not merge {e['class']} into the group")
+            warn(f"could not merge {e['class']} into the group")
 
     visible = next((a for e, a in members if e.get("group_active")), members[0][1])
     focus_checked(visible)
@@ -1173,6 +1204,11 @@ def cmd_restore(args):
                           f"{' '.join(e['cmd'])[:52]}")
                 else:
                     warn(f"{e['class']} did not open a window")
+        if args.spill:
+            moved = spill_strays(entries, addresses, args.spill)
+            if moved:
+                print(f"  moved {len(moved)} window(s) not in this layout "
+                      f"to ws{args.spill}")
         if grouping:
             for gid in dict.fromkeys(e.get("group") for e in entries if e.get("group")):
                 idxs = [i for i, e in enumerate(entries) if e.get("group") == gid]
@@ -1303,7 +1339,15 @@ def main():
                    help="choose the layout and workspace from a menu")
     r.add_argument("--history", action="store_true",
                    help="choose one of the last few saves of this layout instead")
+    r.add_argument("--spill", metavar="WS",
+                   help="move windows on this layout's workspaces that are not part "
+                        "of it to WS first, so they cannot split the arrangement")
     r.set_defaults(func=cmd_restore, verify=True)
+
+    sp = sub.add_parser("spill", help="send the focused window elsewhere")
+    sp.add_argument("--workspace", help=f"workspace to send it to "
+                                        f"(default {SPILL_WORKSPACE})")
+    sp.set_defaults(func=cmd_spill)
 
     sh = sub.add_parser("show", help="print the saved layout")
     sh.set_defaults(func=cmd_show)

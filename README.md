@@ -68,6 +68,7 @@ hypr-layout show                    # print the snapshot
 |---|---|
 | `--pick` | choose the workspace (and the layout, when more than one is saved) from a menu |
 | `--history` | choose one of the last few saves of this layout instead |
+| `--spill WS` | move windows on this layout's workspaces that are not part of it to `WS` first |
 | `--name NAME` | restore a layout saved with `save --name` |
 | `--workspace N` | replay every window onto workspace `N` (name or number) |
 | `--workspace-map 'firefox=2,obs=3'` | per-class workspace override; beats `--workspace` |
@@ -119,6 +120,20 @@ hypr-layout restore --history      # 12 Sep 10:24:09 · 7 windows
 
 Menu: **Layouts… → Go back to an earlier save…**
 
+## Windows that are not in the layout
+
+Anything else on a layout's workspace is a tile the saved tree knows nothing about, and it splits the arrangement — a fifth tile in a 2×2 halves everything. That is what happens when something opens a window while you are working: it lands in the layout and pushes the rest aside.
+
+So a replay can clear them out first, and the focused window can be sent away on a key:
+
+```bash
+hypr-layout restore --spill 10     # strays go to ws10, then the layout is rebuilt
+hypr-layout spill                  # send the focused window to ws10
+hypr-layout spill --workspace 9    # ...or wherever you keep them
+```
+
+Nothing is closed: a stray is moved to another workspace, where it carries on running.
+
 ## Launch-or-focus
 
 `restore` never opens a second copy of something already open. If a window of that class exists, it is focused and moved instead — otherwise Firefox, Zed and OBS would simply open new windows every time you ran it. Candidates are scored on title, workspace and group membership, because every terminal shares a class and grabbing the wrong one drags an unrelated window across your layout. Use `--force` when you really do want new copies.
@@ -150,8 +165,9 @@ Every entry is checked against the compositor afterwards — workspace, tiling, 
 Bindings (`~/.config/hypr/bindings.lua`):
 
 ```lua
-o.bind("SUPER + ALT + W", "Restore a saved layout…", "/home/USER/.local/bin/hypr-layout restore --pick")
+o.bind("SUPER + ALT + W", "Restore a saved layout…", "/home/USER/.local/bin/hypr-layout restore --pick --spill 10")
 o.bind("SUPER + SHIFT + ALT + W", "Save work layout", "/home/USER/.local/bin/hypr-layout save")
+o.bind("SUPER + SHIFT + ALT + S", "Send window to ws10", "/home/USER/.local/bin/hypr-layout spill")
 ```
 
 `--pick` uses the Omarchy menu, so the same commands can live in it
