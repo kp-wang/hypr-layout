@@ -18,11 +18,27 @@ How the replay works (and why it is not flaky):
     from the rectangles the save recorded, by re-inserting the tiles in tree
     order (`layout preselect` + move), because a dwindle tree cannot be set
     directly but can be built;
-  * the result is read back and reported per entry.
+  * the result is read back and reported per entry;
+  * **animations are switched off for the replay** and put back afterwards — a
+    replay is a burst of window moves, and animating all of it reads as a
+    strobe instead of a layout coming back.
 
-  hypr-layout save       snapshot what is on screen right now -> layout.json
-  hypr-layout restore    relaunch everything from the snapshot
-  hypr-layout show       print the saved snapshot
+  hypr-layout save               snapshot what is on screen right now -> layout.json
+  hypr-layout save --name work   keep it as a named layout
+  hypr-layout restore            relaunch everything from the snapshot
+  hypr-layout restore --pick     choose the layout (and workspace) from a menu
+  hypr-layout layouts            list what is saved
+  hypr-layout show               print the saved snapshot
+
+Named layouts live in ~/.config/hypr/layouts/, so a keybinding can offer a
+choice instead of being wired to one file:
+
+  hypr-layout restore --pick             menu: which layout, then which workspace
+  hypr-layout save --pick                menu: name this layout
+  hypr-layout restore --name work        straight to a named layout
+
+The menu is whatever the desktop provides — `omarchy-menu-select` on Omarchy,
+then wofi, rofi, fuzzel, dmenu.
 
 Restore can be pointed at other workspaces without touching the snapshot:
 
@@ -48,6 +64,7 @@ import time
 from collections import defaultdict
 
 LAYOUT = os.path.expanduser("~/.config/hypr/layout.json")
+LAYOUT_DIR = os.path.expanduser("~/.config/hypr/layouts")
 HOME = os.path.expanduser("~")
 # Never replayed: transient or WM-internal surfaces.
 SKIP_CLASSES = {"hyprland", "xwaylandvideobridge"}
@@ -170,6 +187,20 @@ def set_auto_group(enabled):
         print(f"  warning: could not set group:auto_group — {reply[:80]}")
 
 
+def animations_enabled():
+    return "true" in sock_command("getoption animations:enabled")
+
+
+def set_animations(enabled):
+    """A replay moves windows in bursts — parked, re-inserted, resized. With
+    animations on that reads as a strobe; with them off the layout simply
+    appears. The previous value is put back when the replay ends."""
+    value = "true" if enabled else "false"
+    reply = sock_command(f'eval hl.config({{ animations = {{ enabled = {value} }} }})').strip()
+    if reply and reply != "ok":
+        print(f"  warning: could not set animations:enabled — {reply[:80]}")
+
+
 def focus_checked(address, tries=4):
     """Focus a window and confirm it actually got the focus.
 
@@ -205,6 +236,120 @@ def load_layout(path):
         sys.exit(f"hypr-layout: {path} has no windows in it\n"
                  f"             run `hypr-layout save` while your session is open")
     return layout
+
+
+# ── the layout library, and asking through the desktop's own menu ─────────────
+# `--name work` keeps a layout in ~/.config/hypr/layouts/, so a restore can ask
+# which one instead of being wired to a single file. The asking is done by the
+# desktop's menu rather than a UI of our own: on Omarchy that is
+# `omarchy-menu-select`, the same picker its system menus use.
+
+def safe_name(name):
+    """A layout name becomes a filename, so it gets filtered down to one."""
+    clean = "".join(ch for ch in (name or "").strip() if ch.isalnum() or ch in "._ -")
+    clean = os.path.basename(clean).strip()
+    if not clean or clean.startswith("."):
+        sys.exit(f"hypr-layout: {name!r} is not a usable layout name")
+    return clean
+
+
+def named_path(name):
+    return os.path.join(LAYOUT_DIR, safe_name(name) + ".json")
+
+
+def all_layouts():
+    """(name, path, snapshot) for every saved layout, most recent first."""
+    found = [("default", LAYOUT)] if os.path.exists(LAYOUT) else []
+    if os.path.isdir(LAYOUT_DIR):
+        found += [(fn[:-5], os.path.join(LAYOUT_DIR, fn))
+                  for fn in sorted(os.listdir(LAYOUT_DIR)) if fn.endswith(".json")]
+    loaded = []
+    for name, path in found:
+        try:
+            with open(path) as fh:
+                loaded.append((name, path, json.load(fh)))
+        except (OSError, json.JSONDecodeError):
+            continue          # a half-written file should not break the picker
+    loaded.sort(key=lambda item: item[2].get("saved_at", ""), reverse=True)
+    return loaded
+
+
+def menu_pick(prompt, options):
+    """One option from the desktop's menu. Returns the label, '' if cancelled.
+
+    An option may be a (label, subtext) pair; subtext is only shown by menus
+    that can render one (omarchy-menu-select does, the others ignore it).
+    """
+    rows = [(o, None) if isinstance(o, str) else tuple(o) for o in options]
+    for prog, extra in (("omarchy-menu-select", None),
+                        ("wofi", ["--dmenu", "--prompt", prompt]),
+                        ("rofi", ["-dmenu", "-p", prompt]),
+                        ("fuzzel", ["--dmenu", "--prompt", prompt]),
+                        ("dmenu", ["-p", prompt])):
+        if not shutil.which(prog):
+            continue
+        if extra is None:     # options as arguments, selected label on stdout
+            argv = [prog, prompt] + [f"{label}\t{sub}" if sub else label
+                                     for label, sub in rows]
+            stdin = None
+        else:                 # options on stdin, as every dmenu clone expects
+            argv = [prog] + extra
+            stdin = "\n".join(label for label, _ in rows)
+        result = subprocess.run(argv, input=stdin, capture_output=True, text=True)
+        if result.returncode != 0:
+            return ""         # every one of these exits non-zero on ESC
+        # A subtext comes back appended after a tab; the label is the key.
+        return result.stdout.strip().split("\n")[0].split("\t")[0].strip()
+    sys.exit("hypr-layout: no menu to ask (tried omarchy-menu-select, wofi, rofi, "
+             "fuzzel, dmenu) — pass --name or --workspace instead")
+
+
+def ws_sort_key(ws):
+    ws = str(ws)
+    return (not ws.isdigit(), int(ws) if ws.isdigit() else ws)
+
+
+def pick_layout():
+    """Which saved layout? Returns its path."""
+    saved = all_layouts()
+    if not saved:
+        sys.exit("hypr-layout: nothing saved yet — run `hypr-layout save` first")
+    if len(saved) == 1:
+        return saved[0][1]
+    rows = []
+    for name, path, layout in saved:
+        n = len(layout.get("entries", []))
+        rows.append((name, f"{n} window{'s' if n != 1 else ''} · "
+                           f"saved {layout.get('saved_at', '?')}"))
+    choice = menu_pick("Restore which layout?", rows)
+    if not choice:
+        sys.exit("hypr-layout: cancelled")
+    for name, path, _ in saved:
+        if name == choice:
+            return path
+    sys.exit(f"hypr-layout: no layout named {choice!r}")
+
+
+def pick_workspace(layout):
+    """Which workspace? 'as saved' keeps the snapshot's own workspaces."""
+    saved = {str(e["workspace"]) for e in layout["entries"]}
+    live = {workspace_of(c) for c in clients()}
+    choices = ["as saved"] + sorted(saved | live, key=ws_sort_key)
+    choice = menu_pick("Put it on which workspace?", choices)
+    if not choice:
+        sys.exit("hypr-layout: cancelled")
+    return choice
+
+
+def ask_name():
+    """Prompt for a layout name through the desktop's menu."""
+    if shutil.which("omarchy-menu-input"):
+        result = subprocess.run(["omarchy-menu-input", "Save this layout as…"],
+                                capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+        sys.exit("hypr-layout: cancelled")
+    sys.exit("hypr-layout: no input menu available — pass --name instead")
 
 
 # ── capture ──────────────────────────────────────────────────────────────────
@@ -255,6 +400,8 @@ def sanitize(cls, argv, cwd, title=""):
 
 
 def cmd_save(args):
+    if getattr(args, "pick", False):
+        args.file = named_path(ask_name())
     layout_monitors = json.loads(sock_command("j/monitors"))
     entries, skipped = [], []
     for c in clients():
@@ -294,6 +441,7 @@ def cmd_save(args):
                      for m in layout_monitors],
         "entries": entries,
     }
+    os.makedirs(os.path.dirname(args.file), exist_ok=True)
     if os.path.exists(args.file):  # keep the previous save around
         shutil.copy2(args.file, args.file + ".bak")
     with open(args.file, "w") as fh:
@@ -321,6 +469,18 @@ def cmd_show(args):
 
 
 # ── replay ───────────────────────────────────────────────────────────────────
+
+def cmd_layouts(args):
+    saved = all_layouts()
+    if not saved:
+        print("no layouts saved yet — run `hypr-layout save`")
+        return
+    for name, path, layout in saved:
+        n = len(layout.get("entries", []))
+        default = "   (the default)" if path == LAYOUT else ""
+        print(f"  {name:<20} {n:>2} window{'s' if n != 1 else ''}   "
+              f"saved {layout.get('saved_at', '?')}{default}")
+
 
 def order_for_launch(entries):
     """Keep a group's members back to back, so they are merged in one run."""
@@ -403,29 +563,64 @@ def existing_pool(force):
     return pool
 
 
-def take_existing(pool, entry):
-    """Best reuse candidate for this entry, or None to launch a new window."""
-    candidates = pool.get(entry["class"])
-    if not candidates:
-        return None
+def rect_distance(client, entry):
+    """How far a live window is from where this entry wants it, squared.
 
-    def score(c):
-        points = 0
-        title = (entry.get("title") or "").strip()
-        live = (c.get("title") or "").strip()
-        if title and live == title:
-            points += 4
-        elif title and live[:12] == title[:12]:
-            points += 2
-        if workspace_of(c) == str(entry["workspace"]):
-            points += 2
-        if bool(c.get("grouped")) == bool(entry.get("group")):
-            points += 1
-        return points
+    Used only to break ties (see take_existing). Windows of the same class are
+    not always distinguishable — two Firefox windows share a class, and their
+    titles change as pages navigate — so when the score cannot tell them apart,
+    the one already nearest its target is the safer pick: a restore then leaves
+    a window where it is instead of swapping two of them for no reason.
+    """
+    want = saved_rect(entry)
+    if not want:
+        return float("inf")
+    have = rect_of(client)
+    return (have[0] - want[0]) ** 2 + (have[1] - want[1]) ** 2
 
-    best = max(candidates, key=score)
-    candidates.remove(best)
-    return best
+
+def title_score(entry, client):
+    """How much a live title looks like the one the save recorded."""
+    title = (entry.get("title") or "").strip()
+    live = (client.get("title") or "").strip()
+    if not title:
+        return 0
+    if live == title:
+        return 4
+    return 2 if live[:12] == title[:12] else 0
+
+
+def context_score(entry, client):
+    """Same workspace, and grouped or not, as the entry expects."""
+    return (2 if workspace_of(client) == str(entry["workspace"]) else 0) + \
+           (1 if bool(client.get("grouped")) == bool(entry.get("group")) else 0)
+
+
+def match_existing(pool, entries):
+    """Which open window fills which entry: {entry index -> address}.
+
+    Asking entries one at a time is not enough. Two windows can share a class
+    and be indistinguishable by anything durable — two Firefox windows drift
+    apart in title as pages navigate — so whichever entry is asked first takes
+    the window that a later entry matches by name, and the two trade places.
+    So every (entry, window) pair is scored up front and the most confident
+    pairs are claimed first. A tie goes to the window already nearest where
+    that entry wants it, so a restore does not move a window for nothing.
+    """
+    pairs = []
+    for i, e in enumerate(entries):
+        for c in pool.get(e["class"], []):
+            pairs.append((title_score(e, c) + context_score(e, c),
+                          rect_distance(c, e), i, c["address"]))
+    pairs.sort(key=lambda p: (-p[0], p[1]))
+    chosen, taken_entries, taken = {}, set(), set()
+    for _points, _dist, i, address in pairs:
+        if i in taken_entries or address in taken:
+            continue
+        taken_entries.add(i)
+        taken.add(address)
+        chosen[i] = address
+    return chosen
 
 
 def spawn(entry):
@@ -569,6 +764,13 @@ def build_group(entries, addresses):
         for attempt in range(2):
             if not focus_checked(addr):
                 break
+            # A window that is grouped with something else has to leave that
+            # group first, or it cannot be merged into this one — which is what
+            # happens when two same-class windows were paired the other way.
+            if (by_address(addr) or {}).get("grouped"):
+                dispatch("hl.dsp.window.move({ out_of_group = true })")
+                time.sleep(0.1)
+                focus_checked(addr)
             # Re-inserting next to the anchor makes the two neighbours in the
             # tiling tree, which is what `into_group` needs.
             if attempt:
@@ -737,10 +939,17 @@ def arrange(entries, addresses, workspace):
 
 
 def cmd_restore(args):
+    if getattr(args, "pick", False):
+        args.file = pick_layout()
     layout = load_layout(args.file)
     entries = layout["entries"]
     if args.except_:
         entries = [e for e in entries if e["class"] not in args.except_]
+
+    if getattr(args, "pick", False):
+        chosen = pick_workspace(layout)
+        if chosen != "as saved":
+            args.workspace = chosen
 
     mapping = parse_workspace_map(args.workspace_map) if args.workspace_map else {}
     if args.workspace or mapping:
@@ -749,11 +958,12 @@ def cmd_restore(args):
 
     if args.dry_run:
         pool = existing_pool(args.force)
+        plan = match_existing(pool, entries)
         reused = 0
         print(f"would replay {len(entries)} windows from {args.file}:")
         for i, e in enumerate(entries, 1):
             tab = f" [tab {e['group_index'] + 1}]" if e.get("group") else ""
-            have = take_existing(pool, e)
+            have = plan.get(i - 1)
             reused += 1 if have else 0
             note = "  (focus the open window)" if have else ""
             print(f"  {i:2}. ws{e['workspace']:<6} {e['class']:<18} "
@@ -776,23 +986,31 @@ def cmd_restore(args):
         # group on their own and land in the wrong tab.
         set_auto_group(False)
 
-    # Snapshot what is already open so an entry can focus an existing window
-    # instead of starting a second copy (the Omarchy launch-or-focus idiom).
-    pool = existing_pool(args.force)
-
-    addresses, reused_flags, to_launch = {}, set(), []
-    for i, e in enumerate(entries):
-        existing = take_existing(pool, e)
-        if existing:
-            reused_flags.add(i)
-            place(e, existing["address"])
-            addresses[i] = existing["address"]
-            print(f"  {i + 1:2}. ws{e['workspace']:<6} {e['class']:<18} "
-                  "(focused the window already open)")
-        else:
-            to_launch.append(i)
+    was_anim = animations_enabled()
+    if was_anim:
+        # A replay parks and re-inserts every tile, so with animations on you
+        # watch the whole layout strobe its way back. With them off it looks
+        # like the layout simply appears, which is the point.
+        set_animations(False)
 
     try:
+        # Snapshot what is already open so an entry can focus an existing window
+        # instead of starting a second copy (the Omarchy launch-or-focus idiom).
+        pool = existing_pool(args.force)
+        plan = match_existing(pool, entries)
+
+        addresses, reused_flags, to_launch = {}, set(), []
+        for i, e in enumerate(entries):
+            address = plan.get(i)
+            if address:
+                reused_flags.add(i)
+                place(e, address)
+                addresses[i] = address
+                print(f"  {i + 1:2}. ws{e['workspace']:<6} {e['class']:<18} "
+                      "(focused the window already open)")
+            else:
+                to_launch.append(i)
+
         if to_launch:
             launched = launch_all([entries[i] for i in to_launch], args.delay)
             for slot, i in enumerate(to_launch):
@@ -824,6 +1042,8 @@ def cmd_restore(args):
     finally:
         if grouping and was_auto:
             set_auto_group(True)
+        if was_anim:
+            set_animations(True)
 
     ok, total = report(entries, addresses)
     print(f"{ok}/{total} windows placed correctly  ({time.time() - started:.1f}s)")
@@ -898,6 +1118,9 @@ def main():
     s = sub.add_parser("save", help="snapshot the current layout")
     s.add_argument("--floating", action="store_true",
                    help="include floating windows (their size and position are saved)")
+    s.add_argument("--name", help="save as a named layout in ~/.config/hypr/layouts/")
+    s.add_argument("--pick", action="store_true",
+                   help="ask for the name in a menu instead of typing it")
     s.set_defaults(func=cmd_save)
 
     r = sub.add_parser("restore", help="relaunch the saved layout")
@@ -920,12 +1143,24 @@ def main():
                         "rebuild the tiling arrangement they were saved in")
     r.add_argument("--no-verify", action="store_true",
                    help="skip the final snapshot comparison")
+    r.add_argument("--name", help="restore a layout saved with `save --name`")
+    r.add_argument("--pick", action="store_true",
+                   help="choose the layout and workspace from a menu")
     r.set_defaults(func=cmd_restore, verify=True)
 
     sh = sub.add_parser("show", help="print the saved layout")
     sh.set_defaults(func=cmd_show)
 
+    lst = sub.add_parser("layouts", help="list saved layouts")
+    lst.set_defaults(func=cmd_layouts)
+
     args = ap.parse_args()
+    if getattr(args, "name", None):
+        if args.file != LAYOUT:
+            ap.error("use either --name or --file, not both")
+        args.file = named_path(args.name)
+    if getattr(args, "pick", False) and args.file != LAYOUT:
+        ap.error("--pick chooses the layout itself — drop --name/--file")
     if getattr(args, "no_verify", False):
         args.verify = False
     SOCKET_DIR = instance_dir()
