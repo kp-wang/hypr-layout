@@ -38,7 +38,7 @@ choice instead of being wired to one file:
   hypr-layout save --pick                menu: name this layout
   hypr-layout restore --name work        straight to a named layout
   hypr-layout restore --history          back to one of the last few saves
-  hypr-layout spill                      send the focused window to ws10
+  hypr-layout spill                      send the focused window to ws5
 
 `restore --spill WS` first moves any window on the layout's workspaces that is
 not part of it to WS: a stray window is a tile the saved tree knows nothing
@@ -79,7 +79,7 @@ LAYOUT_DIR = os.path.expanduser("~/.config/hypr/layouts")
 LAYOUT_HISTORY = os.path.expanduser("~/.config/hypr/layout-history")
 HISTORY_KEEP = 5          # earlier saves kept per layout
 WORKSPACE_RANGE = 10      # numeric workspaces offered (Hyprland has no fixed count)
-SPILL_WORKSPACE = 10      # where `--spill` and `spill` park windows by default
+SPILL_WORKSPACE = 5       # where `--spill` and `spill` park windows by default
 HOME = os.path.expanduser("~")
 # Never replayed: transient or WM-internal surfaces.
 SKIP_CLASSES = {"hyprland", "xwaylandvideobridge"}
@@ -620,9 +620,40 @@ def spill_strays(entries, addresses, target):
     strays = [c for c in clients()
               if workspace_of(c) in spaces and c["address"] not in known]
     for c in strays:
+        address = c["address"]
+        # A stray that has become a tab in one of the layout's tiles has to
+        # leave that group first — moving one member of a group takes the
+        # group with it, so it would either drag layout windows along or be
+        # dragged straight back by the arrangement.
+        if c.get("grouped") and focus_checked(address):
+            dispatch("hl.dsp.window.move({ out_of_group = true })")
+            time.sleep(0.1)
         dispatch(f'hl.dsp.window.move({{ workspace = "{target}", follow = false, '
-                 f'window = "address:{c["address"]}" }})')
+                 f'window = "address:{address}" }})')
     return strays
+
+
+def dissolve_solo_groups(entries, addresses):
+    """Break up any group holding a single window.
+
+    A group of one is not a group, but it still draws a tab bar — so the window
+    sits 28 px down from where it was saved and reports as "unexpectedly
+    grouped". Pulling a stray out of one of the layout's tiles leaves exactly
+    that behind.
+    """
+    for i, _e in enumerate(entries):
+        address = addresses.get(i)
+        client = by_address(address) if address else None
+        if not (client and client.get("grouped")):
+            continue
+        gid = client["grouped"][0]
+        members = [c for c in clients()
+                   if c.get("grouped") and c["grouped"][0] == gid]
+        if len(members) > 1:
+            continue
+        if focus_checked(address):
+            dispatch("hl.dsp.window.move({ out_of_group = true })")
+            time.sleep(0.08)
 
 
 def cmd_spill(args):
@@ -1209,6 +1240,7 @@ def cmd_restore(args):
             if moved:
                 print(f"  moved {len(moved)} window(s) not in this layout "
                       f"to ws{args.spill}")
+        dissolve_solo_groups(entries, addresses)
         if grouping:
             for gid in dict.fromkeys(e.get("group") for e in entries if e.get("group")):
                 idxs = [i for i, e in enumerate(entries) if e.get("group") == gid]

@@ -127,8 +127,8 @@ Anything else on a layout's workspace is a tile the saved tree knows nothing abo
 So a replay can clear them out first, and the focused window can be sent away on a key:
 
 ```bash
-hypr-layout restore --spill 10     # strays go to ws10, then the layout is rebuilt
-hypr-layout spill                  # send the focused window to ws10
+hypr-layout restore --spill 5      # strays go to ws5, then the layout is rebuilt
+hypr-layout spill                  # send the focused window to ws5
 hypr-layout spill --workspace 9    # ...or wherever you keep them
 ```
 
@@ -165,9 +165,9 @@ Every entry is checked against the compositor afterwards — workspace, tiling, 
 Bindings (`~/.config/hypr/bindings.lua`):
 
 ```lua
-o.bind("SUPER + ALT + W", "Restore a saved layout…", "/home/USER/.local/bin/hypr-layout restore --pick --spill 10")
+o.bind("SUPER + ALT + W", "Restore a saved layout…", "/home/USER/.local/bin/hypr-layout restore --pick --spill 5")
 o.bind("SUPER + SHIFT + ALT + W", "Save work layout", "/home/USER/.local/bin/hypr-layout save")
-o.bind("SUPER + SHIFT + ALT + S", "Send window to ws10", "/home/USER/.local/bin/hypr-layout spill")
+o.bind("SUPER + SHIFT + ALT + S", "Send window to ws5", "/home/USER/.local/bin/hypr-layout spill")
 ```
 
 `--pick` uses the Omarchy menu, so the same commands can live in it
