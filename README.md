@@ -185,6 +185,8 @@ or a reshuffle. This is a small tool for that one job.
 - **One socket, not `hyprctl`.** Every dispatch goes over the command socket — about 0.1 ms against roughly 15 ms for spawning `hyprctl` per call.
 - **Apps launch in parallel**, and each window is placed the instant it is announced on the event socket, instead of polling and sleeping between launches.
 - **Placement is explicit and by address** — never inferred from a window rule.
+- **A saved command is repaired before it is run.** Apps that rewrite their own command line — Electron and Chromium do — collapse the NUL separators in `/proc/<pid>/cmdline`, so the command arrives as one string holding the whole line. It is split back into arguments; without that, executing it fails with `ENOENT` and the window silently never appears.
+- **A failed launch says so out loud.** stdout is not a terminal when the replay comes from a keybinding or a menu, so warnings also go to the desktop notification daemon.
 - **Everything that acts on the active window is preceded by a verified focus**, because that is the one mistake that damages a live layout instead of failing cleanly.
 - **`group:auto_group` is disabled for the whole replay** (including the arrangement pass) and restored afterwards, so windows opened mid-replay cannot join a group they do not belong to.
 - **Animations are switched off for the replay** and restored afterwards. A replay parks and re-inserts every tile; with animations on you watch the layout strobe its way back, with them off it looks like the layout simply appears.
@@ -195,6 +197,7 @@ or a reshuffle. This is a small tool for that one job.
 - The arrangement builder assumes the tiled windows in a snapshot form a clean BSP. A snapshot taken with overlapping or partially off-screen windows falls back to members-only restore (`--no-arrange` behaviour).
 - Split ratios are re-applied for splits that are not near 50/50; near-half splits keep the compositor's default.
 - Floating windows are only captured with `save --floating`.
+- `--no-groups` also gives up the arrangement for those windows: a tile is moved as a unit through its group, so a tile whose windows were left ungrouped cannot be rebuilt as one.
 - Windows of one class are told apart by title, workspace and group. When the titles have drifted there is nothing left to tell them apart, so the tie-break keeps the window nearest its target instead of moving it — a restore does not reshuffle what it cannot identify.
 - Earlier saves are kept per layout, to a fixed depth of 5; there is no promotion of one to "the good one".
 - Verified on one Hyprland version (0.56.2). The IPC commands used are long-standing, but newer builds may rename dispatchers — if a dispatch fails the tool reports it rather than failing silently.
