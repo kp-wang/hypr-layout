@@ -274,11 +274,16 @@ def all_layouts():
     return loaded
 
 
-def menu_pick(prompt, options):
+def menu_pick(prompt, options, width=460, icon="󱂬"):
     """One option from the desktop's menu. Returns the label, '' if cancelled.
 
     An option may be a (label, subtext) pair; subtext is only shown by menus
     that can render one (omarchy-menu-select does, the others ignore it).
+
+    Two things about how this menu renders, learned the hard way: a row needs a
+    leading glyph, or the label is drawn clipped, and the panel does not grow to
+    fit — a long prompt or subtext is cut off with an ellipsis instead. The
+    glyph is drawn but never returned, so the label still comes back alone.
     """
     rows = [(o, None) if isinstance(o, str) else tuple(o) for o in options]
     for prog, extra in (("omarchy-menu-select", None),
@@ -289,8 +294,9 @@ def menu_pick(prompt, options):
         if not shutil.which(prog):
             continue
         if extra is None:     # options as arguments, selected label on stdout
-            argv = [prog, prompt] + [f"{label}\t{sub}" if sub else label
+            argv = [prog, prompt] + ["\t".join([icon, label] + ([sub] if sub else []))
                                      for label, sub in rows]
+            argv += ["--", "--width", str(width)]
             stdin = None
         else:                 # options on stdin, as every dmenu clone expects
             argv = [prog] + extra
@@ -310,32 +316,39 @@ def ws_sort_key(ws):
 
 
 def pick_layout():
-    """Which saved layout? Returns its path."""
+    """Which saved layout? Returns (name, path).
+
+    The question is always asked, even when only one layout is saved: the
+    picker exists to answer "which one?", and a silent skip makes the next
+    question ("which workspace?") look like it came from nowhere.
+    """
     saved = all_layouts()
     if not saved:
         sys.exit("hypr-layout: nothing saved yet — run `hypr-layout save` first")
-    if len(saved) == 1:
-        return saved[0][1]
     rows = []
     for name, path, layout in saved:
         n = len(layout.get("entries", []))
-        rows.append((name, f"{n} window{'s' if n != 1 else ''} · "
-                           f"saved {layout.get('saved_at', '?')}"))
+        when = (layout.get("saved_at") or "?")[5:16]      # "09-12 09:49"
+        rows.append((name, f"{n} windows · {when}"))
     choice = menu_pick("Restore which layout?", rows)
     if not choice:
         sys.exit("hypr-layout: cancelled")
     for name, path, _ in saved:
         if name == choice:
-            return path
+            return name, path
     sys.exit(f"hypr-layout: no layout named {choice!r}")
 
 
-def pick_workspace(layout):
-    """Which workspace? 'as saved' keeps the snapshot's own workspaces."""
-    saved = {str(e["workspace"]) for e in layout["entries"]}
-    live = {workspace_of(c) for c in clients()}
-    choices = ["as saved"] + sorted(saved | live, key=ws_sort_key)
-    choice = menu_pick("Put it on which workspace?", choices)
+def pick_workspace(layout, label):
+    """Which workspace? 'as saved' keeps the workspaces the layout recorded."""
+    saved = sorted({str(e["workspace"]) for e in layout["entries"]}, key=ws_sort_key)
+    live = set()
+    for c in clients():
+        live.add(workspace_of(c))
+    rows = [("keep as saved", "everything back on its own workspace")]
+    for ws in sorted(set(saved) | live, key=ws_sort_key):
+        rows.append((ws, f"move everything to ws{ws}"))
+    choice = menu_pick("Where should it go?", rows)
     if not choice:
         sys.exit("hypr-layout: cancelled")
     return choice
@@ -939,16 +952,17 @@ def arrange(entries, addresses, workspace):
 
 
 def cmd_restore(args):
+    picked = None
     if getattr(args, "pick", False):
-        args.file = pick_layout()
+        picked, args.file = pick_layout()
     layout = load_layout(args.file)
     entries = layout["entries"]
     if args.except_:
         entries = [e for e in entries if e["class"] not in args.except_]
 
     if getattr(args, "pick", False):
-        chosen = pick_workspace(layout)
-        if chosen != "as saved":
+        chosen = pick_workspace(layout, picked or args.file)
+        if chosen != "keep as saved":
             args.workspace = chosen
 
     mapping = parse_workspace_map(args.workspace_map) if args.workspace_map else {}
