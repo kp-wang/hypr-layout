@@ -4,12 +4,13 @@
 
 Save your Hyprland session and get it back — windows, workspaces, tab groups **and the arrangement they were in**.
 
-Three commands:
-
 ```bash
-hypr-layout save       # snapshot what is on screen now
-hypr-layout restore    # put everything back
-hypr-layout show       # print the saved snapshot
+hypr-layout save               # snapshot what is on screen now
+hypr-layout restore            # put everything back
+hypr-layout restore --pick     # pick a layout and a workspace from a menu
+hypr-layout save --name work   # keep more than one layout, side by side
+hypr-layout layouts            # what is saved, and how many earlier saves exist
+hypr-layout show               # print the saved snapshot
 ```
 
 One Python file, standard library only, no build step, no plugin ABI to chase. It talks to Hyprland's IPC sockets — the command socket for dispatches and the event socket to learn the moment a window opens.
@@ -65,6 +66,9 @@ hypr-layout show                    # print the snapshot
 
 | flag | effect |
 |---|---|
+| `--pick` | choose the workspace (and the layout, when more than one is saved) from a menu |
+| `--history` | choose one of the last few saves of this layout instead |
+| `--name NAME` | restore a layout saved with `save --name` |
 | `--workspace N` | replay every window onto workspace `N` (name or number) |
 | `--workspace-map 'firefox=2,obs=3'` | per-class workspace override; beats `--workspace` |
 | `--except CLASS` | skip a class (repeatable) |
@@ -76,11 +80,52 @@ hypr-layout show                    # print the snapshot
 | `-f FILE` | use a different layout file |
 | `--floating` (on `save`) | also capture floating windows, with their size and position |
 
-### Launch-or-focus
+## More than one layout
+
+The plain `save`/`restore` pair is wired to a single file, `~/.config/hypr/layout.json`.
+`--name` keeps as many others as you like in `~/.config/hypr/layouts/`:
+
+```bash
+hypr-layout save --name work       # -> ~/.config/hypr/layouts/work.json
+hypr-layout restore --name work
+hypr-layout layouts                # name, windows, when it was saved
+```
+
+`--pick` asks instead of being told, and the asking is done by the menu your desktop
+already has — on Omarchy that is `omarchy-menu-select`, the same picker its system
+menus use (falling back to wofi, rofi, fuzzel, dmenu):
+
+```
+Where should it go?
+  keep as saved     everything back on its own workspace
+  1                 move everything to ws1 (has windows)
+  2                 move everything to ws2
+  …
+```
+
+Workspaces 1–10 are offered whether or not they exist yet — Hyprland creates a
+workspace the moment a window lands on it, so a number that is still empty is a
+valid answer. With more than one layout saved, the layout is asked for first.
+
+## Going back a save
+
+Every `save` rotates the file it is about to replace into `~/.config/hypr/layout-history/`,
+keeping the last 5 per layout — so a save taken at a bad moment does not cost you
+the good one:
+
+```bash
+hypr-layout restore --history      # 12 Sep 10:24:09 · 7 windows
+```
+
+Menu: **Layouts… → Go back to an earlier save…**
+
+## Launch-or-focus
 
 `restore` never opens a second copy of something already open. If a window of that class exists, it is focused and moved instead — otherwise Firefox, Zed and OBS would simply open new windows every time you ran it. Candidates are scored on title, workspace and group membership, because every terminal shares a class and grabbing the wrong one drags an unrelated window across your layout. Use `--force` when you really do want new copies.
 
-### What a restore reports
+Two windows can share a class and be genuinely hard to tell apart — two Firefox windows drift apart in title as you navigate, and a title is not an identity. The pairing is therefore decided for all entries at once: every (entry, window) pair is scored, the most confident pairs are claimed first, and a tie goes to the window already nearest where that entry wants it. Matching one entry at a time is what let two browsers trade places on restore.
+
+## What a restore reports
 
 ```
 replaying 4 windows
@@ -105,9 +150,21 @@ Every entry is checked against the compositor afterwards — workspace, tiling, 
 Bindings (`~/.config/hypr/bindings.lua`):
 
 ```lua
-o.bind("SUPER + ALT + W", "Restore work layout", "/home/USER/.local/bin/hypr-layout restore")
+o.bind("SUPER + ALT + W", "Restore a saved layout…", "/home/USER/.local/bin/hypr-layout restore --pick")
 o.bind("SUPER + SHIFT + ALT + W", "Save work layout", "/home/USER/.local/bin/hypr-layout save")
 ```
+
+`--pick` uses the Omarchy menu, so the same commands can live in it
+(`~/.config/omarchy/extensions/omarchy-menu.jsonc`, which hot-reloads):
+
+```jsonc
+"layouts": {"icon":"󱂬","label":"Layouts","description":"Save and restore window layouts"},
+"layouts.restore": {"label":"Restore layout…","action":"hypr-layout restore --pick"},
+"layouts.undo": {"label":"Go back to an earlier save…","action":"hypr-layout restore --pick --history"},
+"layouts.save": {"label":"Save layout as…","action":"hypr-layout save --pick"},
+```
+
+A row needs its leading glyph: without one the menu draws the label clipped.
 
 Replay at login (`~/.config/hypr/autostart.lua`):
 
@@ -130,6 +187,7 @@ or a reshuffle. This is a small tool for that one job.
 - **Placement is explicit and by address** — never inferred from a window rule.
 - **Everything that acts on the active window is preceded by a verified focus**, because that is the one mistake that damages a live layout instead of failing cleanly.
 - **`group:auto_group` is disabled for the whole replay** (including the arrangement pass) and restored afterwards, so windows opened mid-replay cannot join a group they do not belong to.
+- **Animations are switched off for the replay** and restored afterwards. A replay parks and re-inserts every tile; with animations on you watch the layout strobe its way back, with them off it looks like the layout simply appears.
 - **Arrangement is rebuilt** by parking the tiles on a hidden workspace (`special:hypr-layout`), deriving the dwindle tree from the saved rectangles, and re-inserting them in tree order with `layout preselect` + move. Anything that fails to land is moved back — a window is never left parked.
 
 ## Limitations
@@ -137,6 +195,8 @@ or a reshuffle. This is a small tool for that one job.
 - The arrangement builder assumes the tiled windows in a snapshot form a clean BSP. A snapshot taken with overlapping or partially off-screen windows falls back to members-only restore (`--no-arrange` behaviour).
 - Split ratios are re-applied for splits that are not near 50/50; near-half splits keep the compositor's default.
 - Floating windows are only captured with `save --floating`.
+- Windows of one class are told apart by title, workspace and group. When the titles have drifted there is nothing left to tell them apart, so the tie-break keeps the window nearest its target instead of moving it — a restore does not reshuffle what it cannot identify.
+- Earlier saves are kept per layout, to a fixed depth of 5; there is no promotion of one to "the good one".
 - Verified on one Hyprland version (0.56.2). The IPC commands used are long-standing, but newer builds may rename dispatchers — if a dispatch fails the tool reports it rather than failing silently.
 
 ## License
