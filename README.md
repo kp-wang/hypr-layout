@@ -60,6 +60,7 @@ hypr-layout save                    # snapshot -> ~/.config/hypr/layout.json  (d
 hypr-layout restore                 # replay it
 hypr-layout restore --dry-run       # show what would happen, change nothing
 hypr-layout show                    # print the snapshot
+hypr-layout log                     # print the last run's trace (`--previous` for the one before)
 ```
 
 `restore` options:
@@ -145,6 +146,10 @@ Nothing is closed either way: a stray is moved or tucked, never killed.
 
 Two windows can share a class and be genuinely hard to tell apart — two Firefox windows drift apart in title as you navigate, and a title is not an identity. The pairing is therefore decided for all entries at once: every (entry, window) pair is scored, the most confident pairs are claimed first, and a tie goes to the window already nearest where that entry wants it. Matching one entry at a time is what let two browsers trade places on restore.
 
+A Chromium window changes class from one session to the next, because Chromium takes its app id from how its *first* process was started: through `/usr/bin/chromium` (the wrapper that sets `CHROME_WRAPPER`) the window is `chromium`, started as the bare `/usr/lib/chromium/chromium` it is `chromium-browser`. Same browser either way, so the two names are one class as far as matching goes. Before that, a snapshot taken in one session never recognised the browser in the next: every replay opened another copy — and, because the copy also did not match, left it behind as a stray. That is the failure the run log exists to make visible.
+
+Chromium **web apps** (the `--app=` windows Omarchy opens for Discord, WhatsApp and friends, named `chrome-<url>__<profile>`) cannot be relaunched at all: the window belongs to the shared browser process, so the command line saved for it is the plain browser's, and running that opens a blank tab rather than the app. Such an entry is matched to its window when one is open and reported when it is not — it is never launched into a blank window that then splits the layout. `--force` overrides this like every other launch decision.
+
 ## What a restore reports
 
 ```
@@ -164,6 +169,51 @@ snapshot matches the live session
 ```
 
 Every entry is checked against the compositor afterwards — workspace, tiling, tab number, which tab is showing, and the arrangement. A window in the wrong place is reported with the rectangle it got and the one it should have had, so "it looks fine" is never the evidence.
+
+## When a replay goes wrong
+
+A replay usually starts from a keybinding, where stdout has nowhere to go — so a
+replay that half-worked used to leave nothing behind to look at. Every run now
+writes its whole trace to `~/.local/state/hypr-layout/last-run.log`, and the run
+before it to `previous-run.log`:
+
+```bash
+hypr-layout log              # what the last replay did
+hypr-layout log --previous   # the one before it
+```
+
+It records each dispatch *and what the compositor answered*, which window was
+matched to which entry and by what evidence, every launch with its pid, every
+window event, which groups and arrangement passes ran, and what was skipped and
+why — plus a traceback if it ever crashes. The compositor's usual way to fail is
+to answer `ok` and do something else, so the reply alone is not proof; what came
+before it is.
+
+A replay that cannot do part of its job says so instead of going quiet: a group
+whose window never opened, a workspace whose arrangement was skipped for want of
+a tile, a window that opened during the replay and could not be matched to
+anything.
+
+Only one replay runs at a time. A second one started on top of the first parks
+tiles the first is still inserting and dissolves the groups it has just built —
+which is what a double-press of the keybinding looks like from the inside, and
+it leaves a layout with nothing grouped and no clue why. The second one is
+refused, and says who is still working.
+
+## Checking it
+
+`tests/replay-check` is an end-to-end check for a live session: it builds a 2×2
+fixture with a group of three tabs on its own workspace, saves it, kills the
+windows, relaunches them scrambled (two of them only when the replay starts
+them), replays, and fails if a window, a rectangle, a tab order or a thing that
+should *not* be grouped comes back wrong. It also checks that the trace lands on
+disk and that a second concurrent replay is refused. It uses its own window
+class and cleans up after itself, but it does move windows, so run it when you
+are not mid-something.
+
+```bash
+python3 tests/replay-check
+```
 
 ## Omarchy
 
@@ -190,10 +240,12 @@ A row needs its leading glyph: without one the menu draws the label clipped.
 Replay at login (`~/.config/hypr/autostart.lua`):
 
 ```lua
-o.launch_on_start("bash -c 'sleep 8; echo \"=== $(date -Is) ===\"; ~/.local/bin/hypr-layout restore --no-verify' >>\"$HOME/.cache/hypr-layout-login.log\" 2>&1")
+o.launch_on_start("bash -c 'sleep 8; ~/.local/bin/hypr-layout restore --no-verify'")
 ```
 
-The sleep lets the session settle, and the log is there because a login-time replay has nowhere to print.
+The sleep lets the session settle before the replay starts moving windows. There is no
+redirect: a login-time replay has nowhere to print, which is exactly why the run log
+exists — `hypr-layout log` reads back what it did.
 
 ## Where it fits
 
@@ -208,6 +260,10 @@ or a reshuffle. This is a small tool for that one job.
 - **Placement is explicit and by address** — never inferred from a window rule.
 - **A saved command is repaired before it is run.** Apps that rewrite their own command line — Electron and Chromium do — collapse the NUL separators in `/proc/<pid>/cmdline`, so the command arrives as one string holding the whole line. It is split back into arguments; without that, executing it fails with `ENOENT` and the window silently never appears.
 - **A failed launch says so out loud.** stdout is not a terminal when the replay comes from a keybinding or a menu, so warnings also go to the desktop notification daemon.
+- **The run keeps a trace.** Every dispatch and its reply, every match, launch, event, group and arrangement decision goes to `~/.local/state/hypr-layout/last-run.log`, because a replay that runs from a keybinding has no terminal to leave its output in — and the interesting failure is the one that never gets to say anything on the way out. `hypr-layout log` prints it.
+- **Nothing gives up quietly.** A group whose window never opened, a workspace whose arrangement was skipped, a window that appeared and matched nothing: each is named. A replay that silently stops halfway is indistinguishable from one that is still working.
+- **One replay at a time**, so a second press of the keybinding cannot stampede the first one's half-built layout.
+- **Launches are waited for only as long as it can still help.** A launcher that has already exited and produced no window — a hand-off to the running browser — is given a few seconds, not the full timeout, so a replay that cannot place everything still finishes promptly.
 - **Everything that acts on the active window is preceded by a verified focus**, because that is the one mistake that damages a live layout instead of failing cleanly.
 - **`group:auto_group` is disabled for the whole replay** (including the arrangement pass) and restored afterwards, so windows opened mid-replay cannot join a group they do not belong to.
 - **Animations are switched off for the replay** and restored afterwards. A replay parks and re-inserts every tile; with animations on you watch the layout strobe its way back, with them off it looks like the layout simply appears.
@@ -220,7 +276,9 @@ or a reshuffle. This is a small tool for that one job.
 - Floating windows are only captured with `save --floating`.
 - `--no-groups` also gives up the arrangement for those windows: a tile is moved as a unit through its group, so a tile whose windows were left ungrouped cannot be rebuilt as one.
 - Windows of one class are told apart by title, workspace and group. When the titles have drifted there is nothing left to tell them apart, so the tie-break keeps the window nearest its target instead of moving it — a restore does not reshuffle what it cannot identify.
+- A Chromium web app cannot be brought back by a replay (see above); open it and replay again. Its tile cannot be rebuilt either, so a workspace with a missing tile keeps the tiling it had rather than an approximation — that is reported, not guessed at.
 - Earlier saves are kept per layout, to a fixed depth of 5; there is no promotion of one to "the good one".
+- A replay waits for a launched app for as long as its launcher is still running, then a few seconds more; an app slower than that to show a window is reported as missing. Nothing is left waiting on a window that a process hand-off will never produce.
 - Verified on one Hyprland version (0.56.2). The IPC commands used are long-standing, but newer builds may rename dispatchers — if a dispatch fails the tool reports it rather than failing silently.
 
 ## License

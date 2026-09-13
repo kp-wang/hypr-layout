@@ -29,6 +29,7 @@ How the replay works (and why it is not flaky):
   hypr-layout restore --pick     choose the layout (and workspace) from a menu
   hypr-layout layouts            list what is saved
   hypr-layout show               print the saved snapshot
+  hypr-layout log                print the last replay's trace (--previous for the one before)
 
 Named layouts live in ~/.config/hypr/layouts/, so a keybinding can offer a
 choice instead of being wired to one file:
@@ -68,7 +69,6 @@ import argparse
 import json
 import os
 import queue
-import select
 import shlex
 import shutil
 import socket
@@ -76,17 +76,79 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from collections import defaultdict
 
 LAYOUT = os.path.expanduser("~/.config/hypr/layout.json")
 LAYOUT_DIR = os.path.expanduser("~/.config/hypr/layouts")
 LAYOUT_HISTORY = os.path.expanduser("~/.config/hypr/layout-history")
+STATE_DIR = os.path.expanduser("~/.local/state/hypr-layout")
+LOG_PATH = os.path.join(STATE_DIR, "last-run.log")
+PREV_LOG_PATH = os.path.join(STATE_DIR, "previous-run.log")
+LOCK_PATH = os.path.join(STATE_DIR, "replay.lock")
 HISTORY_KEEP = 5          # earlier saves kept per layout
+LAUNCH_IDLE = 4.0         # seconds without a window before a launch is given up on
 WORKSPACE_RANGE = 10      # numeric workspaces offered (Hyprland has no fixed count)
 SPILL_WORKSPACE = 5       # where `--spill` and `spill` park windows by default
 HOME = os.path.expanduser("~")
 # Never replayed: transient or WM-internal surfaces.
 SKIP_CLASSES = {"hyprland", "xwaylandvideobridge"}
+
+
+# ── the run log ──────────────────────────────────────────────────────────────
+# A replay is started from a keybinding or the menu, so its stdout goes into
+# the void — and when one goes wrong there is nothing left to look at. Every
+# run therefore writes its whole trace to a file: what it dispatched and what
+# the compositor answered, which window it matched to which entry, what it
+# launched, what it could not do and why. The run before it is kept beside it,
+# because the interesting case is a replay that hangs or gets interrupted —
+# that one has no chance to say anything on the way out.
+
+LOG = None       # the open log file, or None outside a run
+
+
+def log_open():
+    global LOG
+    os.makedirs(STATE_DIR, exist_ok=True)
+    if os.path.exists(LOG_PATH):
+        os.replace(LOG_PATH, PREV_LOG_PATH)
+    LOG = open(LOG_PATH, "w", buffering=1)
+
+
+def log_line(message):
+    """Never let logging be the thing that breaks a replay.
+
+    print() arrives as two writes (text, then the newline), so empty pieces are
+    dropped rather than written as blank lines.
+    """
+    if LOG is None or not message.strip():
+        return
+    try:
+        LOG.write(message.rstrip("\n") + "\n")
+    except OSError:
+        pass
+
+
+class Tee:
+    """stdout, copied into the run log.
+
+    `isatty` stays honest: warn() uses it to decide whether a human is
+    watching, and logging to a file must not make it start popping up
+    notifications on a run from a terminal.
+    """
+
+    def __init__(self, stream):
+        self.stream = stream
+
+    def write(self, text):
+        log_line(text)
+        return self.stream.write(text)
+
+    def flush(self):
+        self.stream.flush()
+
+    def isatty(self):
+        return self.stream.isatty()
 
 
 # ── Hyprland connection ──────────────────────────────────────────────────────
@@ -130,8 +192,14 @@ def sock_command(command, timeout=5.0):
 
 
 def dispatch(lua):
-    """Hyprland 0.56 on Omarchy parses `dispatch` as Lua."""
+    """Hyprland 0.56 on Omarchy parses `dispatch` as Lua.
+
+    Every one of these goes to the run log with its reply: a dispatch that
+    answers `ok` and does nothing is this tool's usual way to fail, so the
+    reply — and what came right before it — is the evidence.
+    """
     reply = sock_command(f"dispatch {lua}").strip()
+    log_line(f"    dispatch {lua}  ->  {reply or 'ok'}")
     if reply.startswith("error") or "invalid" in reply.lower():
         return reply
     return reply
@@ -484,13 +552,16 @@ def warn(message):
 
     A replay from a keybinding or a menu has no terminal attached, so stdout
     goes nowhere. If stdout is not a tty, the message also goes to the desktop
-    notification daemon.
+    notification daemon — and it names the run log, which is where the rest of
+    the story is.
     """
     print(f"  warning: {message}")
+    log_line(f"  warning: {message}")
     if sys.stdout.isatty() or not shutil.which("notify-send"):
         return
+    body = message if LOG is None else f"{message}\ntrace: {LOG_PATH}"
     subprocess.run(["notify-send", "-a", "hypr-layout", "-t", "8000",
-                    "hypr-layout", message], capture_output=True)
+                    "hypr-layout", body], capture_output=True)
 
 
 def client_cmd(pid):
@@ -627,6 +698,8 @@ def stray_windows(entries, addresses):
 def spill_strays(entries, addresses, target):
     """Move the strays away to another workspace."""
     strays = stray_windows(entries, addresses)
+    log_line(f"    strays on the layout's workspaces: "
+             f"{', '.join(c['class'] for c in strays) if strays else 'none'}")
     for c in strays:
         address = c["address"]
         # A stray that has become a tab in one of the layout's tiles has to
@@ -828,6 +901,33 @@ def apply_workspace_overrides(entries, global_ws, mapping):
                 e["group"] = None
 
 
+def family(cls):
+    """The class to compare two windows of the same browser by.
+
+    Chromium takes its Wayland app id from how its *first* process was
+    started: through `/usr/bin/chromium` (the wrapper, which sets
+    `CHROME_WRAPPER`) it is `chromium`, started as the bare
+    `/usr/lib/chromium/chromium` it is `chromium-browser`. Same browser, same
+    session, two names — so a snapshot taken in one session never matched the
+    browser in the next, every replay opened another copy, and the copy was
+    left behind as a stray. For matching purposes they are one class.
+    """
+    return "chromium" if cls in ("chromium", "chromium-browser") else cls
+
+
+def is_webapp_window(cls):
+    """True for the windows Chromium opens for an installed web app.
+
+    Omarchy's web apps are chromium called with `--app=<url>`; the window is
+    named `chrome-<url>__<profile>`. The window belongs to the shared browser
+    process, so the command line captured for it is the plain browser's — run
+    that and you get a blank tab, not the app. There is no way back to the app
+    from here, so such an entry is never launched: it is matched to its window
+    when one is open, and reported when it is not.
+    """
+    return cls.startswith("chrome-") and "__" in cls
+
+
 def existing_pool(force):
     """Class -> open windows, for launch-or-focus reuse.
 
@@ -839,7 +939,7 @@ def existing_pool(force):
     pool = defaultdict(list)
     if not force:
         for c in clients():
-            pool[(c.get("class") or "?")].append(c)
+            pool[family(c.get("class") or "?")].append(c)
     return pool
 
 
@@ -888,18 +988,26 @@ def match_existing(pool, entries):
     that entry wants it, so a restore does not move a window for nothing.
     """
     pairs = []
+    live = {c["address"]: c for c in clients()}
     for i, e in enumerate(entries):
-        for c in pool.get(e["class"], []):
+        for c in pool.get(family(e["class"]), []):
             pairs.append((title_score(e, c) + context_score(e, c),
                           rect_distance(c, e), i, c["address"]))
     pairs.sort(key=lambda p: (-p[0], p[1]))
     chosen, taken_entries, taken = {}, set(), set()
-    for _points, _dist, i, address in pairs:
+    for points, dist, i, address in pairs:
         if i in taken_entries or address in taken:
             continue
         taken_entries.add(i)
         taken.add(address)
         chosen[i] = address
+        log_line(f"    matched entry {i} {entries[i]['class']!r} -> "
+                 f"{address} {live.get(address, {}).get('title', '')[:44]!r} "
+                 f"(score {points}, {int(dist ** 0.5)}px away)")
+    for i, e in enumerate(entries):
+        if i not in chosen:
+            log_line(f"    no open window for entry {i} {e['class']!r} "
+                     f"{e['title'][:44]!r} — it has to be launched")
     return chosen
 
 
@@ -955,12 +1063,13 @@ def launch_all(entries, stagger):
     """
     events = Events()
     pending = {}           # pid -> entry index
-    pids = {}
     for i, e in enumerate(entries):
         proc = spawn(e)
         if proc:
-            pids[i] = proc.pid
             pending[proc.pid] = i
+            log_line(f"    launched [{i}] pid {proc.pid} {' '.join(e['cmd'])[:90]}")
+        else:
+            log_line(f"    launch FAILED for [{i}] {e['class']!r}")
         if stagger:
             time.sleep(stagger)
 
@@ -968,14 +1077,30 @@ def launch_all(entries, stagger):
     unclaimed = set(range(len(entries)))   # entry indexes still waiting
     by_class = defaultdict(list)           # class -> waiting entry indexes
     for i in unclaimed:
-        by_class[entries[i]["class"]].append(i)
+        by_class[family(entries[i]["class"])].append(i)
 
-    deadline = time.time() + max(20.0, 10.0 + 3.0 * len(entries))
-    while unclaimed and time.time() < deadline:
-        event = events.next(deadline)
-        if event is None:
+    # How long a window may take to appear. The hard deadline is the old fixed
+    # wait; the soft one ends it much sooner: once nothing we launched is still
+    # running and no window has shown up for LAUNCH_IDLE seconds, none is
+    # coming. Chromium and Firefox hand the window to the process that is
+    # already running — their launcher exits immediately — so without this a
+    # replay that could place everything sat doing nothing for 20 s, which
+    # reads as a hang and invites a second press of the binding.
+    hard_deadline = time.time() + max(20.0, 10.0 + 3.0 * len(entries))
+    last_event = time.time()
+    opened_unclaimed = []                  # windows that were not ours to take
+    while unclaimed and time.time() < hard_deadline:
+        now = time.time()
+        starting = any(os.path.exists(f"/proc/{pid}") for pid in pending)
+        if not starting and now - last_event > LAUNCH_IDLE:
+            log_line(f"    nothing launched is still running and no window for "
+                     f"{LAUNCH_IDLE:.0f}s — stop waiting")
             break
-        _, data = event
+        event = events.next(min(hard_deadline, now + LAUNCH_IDLE))
+        if event is None:
+            continue
+        name, data = event
+        last_event = time.time()
         fields = data.split(",")
         if len(fields) < 3:
             continue
@@ -984,30 +1109,42 @@ def launch_all(entries, stagger):
         client = by_address(address)
         if client is None:
             continue
+        log_line(f"    event {name}: {address} class={cls!r} "
+                 f"pid={client.get('pid')} title={(client.get('title') or '')[:40]!r}")
 
         # Match the window to the entry that produced it, best evidence first:
         # the process we started, then the class we asked for, then — if a
         # single entry is still waiting — the only window that opened after we
         # launched it (apps like Firefox hand the window to another process).
+        how = "our pid"
         idx = pending.get(client.get("pid"))
         if idx is not None and idx not in unclaimed:
             idx = None
         if idx is None:
-            waiting = [j for j in by_class.get(cls, []) if j in unclaimed]
+            waiting = [j for j in by_class.get(family(cls), []) if j in unclaimed]
             idx = waiting[0] if waiting else None
+            how = f"class {cls!r}"
         if idx is None and len(unclaimed) == 1:
             idx = next(iter(unclaimed))
+            how = "only entry still waiting"
         if idx is None:
+            log_line(f"      not for us: no waiting entry has class {family(cls)!r} "
+                     f"(waiting: {sorted(unclaimed)})")
+            opened_unclaimed.append((address, cls))
             continue      # not ours — leave it alone
 
         unclaimed.discard(idx)
         for lst in by_class.values():
             if idx in lst:
                 lst.remove(idx)
+        log_line(f"      -> entry {idx} {entries[idx]['class']!r} ({how})")
         place(entries[idx], address)
         addresses[idx] = address
     events.close()
-    return addresses
+    for i in sorted(unclaimed):
+        log_line(f"    NO WINDOW for entry {i} {entries[i]['class']!r} "
+                 f"{entries[i]['title'][:44]!r}")
+    return addresses, opened_unclaimed
 
 
 def group_order(group_id):
@@ -1036,19 +1173,27 @@ def tab_order_problem(entries, addresses):
         addresses = [addresses.get(i) for i in range(len(entries))]
     problems = {}
     for gid in {e.get("group") for e in entries if e.get("group")}:
-        members = [addresses[i] for i, e in enumerate(entries)
-                   if e.get("group") == gid]
-        keys = {(live[m].get("grouped") or [None])[0] for m in members if m in live}
+        # By saved tab order, not by the order the snapshot lists them in: the
+        # file is written in the order the compositor happened to report the
+        # windows, which has nothing to do with which tab is which. Comparing
+        # the wrong order made this answer "tabs out of order" for groups that
+        # were exactly right — so group_matches said no, and every replay tore
+        # down a correct group and rebuilt it, which is how a rebuild fight
+        # scrambled a layout in the first place.
+        members = sorted(((e.get("group_index", 0), addresses[i], e)
+                          for i, e in enumerate(entries) if e.get("group") == gid),
+                         key=lambda m: m[0])
+        tabbed = [addr for _idx, addr, _e in members]
+        keys = {(live[m].get("grouped") or [None])[0] for m in tabbed if m in live}
         if len(keys) != 1 or None in keys:
             problems[gid] = "windows are not in one group"
             continue
         order = group_order(next(iter(keys)))
-        positions = [order.index(m) for m in members if m in order]
+        positions = [order.index(m) for m in tabbed if m in order]
         if positions != sorted(positions):
             problems[gid] = "tabs out of order"
-        elif any(live[m].get("visible") != bool(e.get("group_active"))
-                 for m, e in zip(members, [x for x in entries if x.get("group") == gid])
-                 if m in live):
+        elif any(live[addr].get("visible") != bool(e.get("group_active"))
+                 for addr, (_i, _a, e) in zip(tabbed, members) if addr in live):
             problems[gid] = "wrong tab showing"
     return problems
 
@@ -1069,7 +1214,7 @@ def group_matches(entries, addresses):
     return not tab_order_problem(entries, addresses).get(entries[0].get("group"))
 
 
-def merge_into_group(anchor, addr, workspace):
+def _merge_into_group(anchor, addr, workspace):
     """Make `addr` a tab of the group that `anchor` is in.
 
     `into_group` only sees a group next door, so the window is parked and
@@ -1104,10 +1249,34 @@ def merge_into_group(anchor, addr, workspace):
     return False
 
 
+def merge_into_group(anchor, addr, workspace, tries=3):
+    """Merge `addr` into the group `anchor` is in, retrying if it does not take.
+
+    Whether the park-and-re-insert dance leaves the window next to the group
+    depends on the tree the workspace happens to have at that moment, so one
+    attempt sometimes finds nothing to merge with — a second attempt starts
+    from a different tree. Retrying costs two tenths of a second and turns a
+    coin toss into a replay that groups reliably.
+    """
+    for attempt in range(tries):
+        if _merge_into_group(anchor, addr, workspace):
+            return True
+        log_line(f"    merge attempt {attempt + 1} of {tries} did not take")
+        time.sleep(0.1)
+    return False
+
+
 def build_group(entries, addresses):
     """Form one window group from windows that are already placed."""
     members = [(e, a) for e, a in zip(entries, addresses) if a and by_address(a)]
     if len(members) < 2:
+        # This used to return in silence, which is how a replay could end with
+        # nothing grouped and no line saying why. Name the missing windows.
+        missing = [e["class"] for e, a in zip(entries, addresses)
+                   if not (a and by_address(a))]
+        print(f"  FAIL group of {len(entries)}: "
+              f"{'no window opened for ' + ', '.join(missing) if missing else 'fewer than two windows are up'}"
+              " — nothing to group")
         return
     anchor = members[0][1]
     if not focus_checked(anchor):
@@ -1118,8 +1287,16 @@ def build_group(entries, addresses):
         time.sleep(0.1)
     dispatch("hl.dsp.group.toggle()")
 
+    # Merge each member against the one saved before it, not against the first:
+    # Hyprland slots a merged window in beside the focused tab, so merging
+    # everything against the anchor put the tabs in the wrong order (foot,
+    # OBS, BlueFerry where the save said foot, BlueFerry, OBS) and the replay
+    # then reported "tabs out of order" for the group it had just built.
+    prev = anchor
     for e, addr in members[1:]:
-        if not merge_into_group(anchor, addr, e["workspace"]):
+        if merge_into_group(prev, addr, e["workspace"]):
+            prev = addr
+        else:
             warn(f"could not merge {e['class']} into the group")
 
     visible = next((a for e, a in members if e.get("group_active")), members[0][1])
@@ -1228,8 +1405,16 @@ def arrange(entries, addresses, workspace):
     """Rebuild one workspace's tiling so the tiles land in their saved rects."""
     tiles = [t for t in tiles_of(entries, addresses) if t["rect"]]
     if len(tiles) < 2 or not all(tile_rep(t, addresses) for t in tiles):
+        # Bailing out in silence left the workspace in whatever shape the
+        # moves so far produced, with nothing to say the arrangement never ran.
+        if len(tiles) >= 2:
+            gone = [entries[t["indexes"][0]]["class"] for t in tiles
+                    if not tile_rep(t, addresses)]
+            print(f"  skipped arrangement of ws{workspace}: no window for "
+                  f"{', '.join(gone)} — the tiling was left as it is")
         return
     tree = arrange_tree([(t["rect"], n) for n, t in enumerate(tiles)])
+    log_line(f"    ws{workspace}: {len(tiles)} tiles, tree {json.dumps(tree)}")
 
     # Park every tile off the workspace first: an empty workspace has no tree,
     # and the build below needs to start from nothing.
@@ -1241,6 +1426,8 @@ def arrange(entries, addresses, workspace):
         tile = tiles[index]
         if anchor is not None:
             if not focus_checked(anchor):     # preselect applies to the focused window
+                print(f"  FAIL arrangement: could not focus {anchor} to place "
+                      f"the {entries[tile['indexes'][0]]['class']} tile beside it")
                 return None
             dispatch(f'hl.dsp.layout("preselect {side}")')
         move_tile(tile_rep(tile, addresses), workspace)
@@ -1269,6 +1456,49 @@ def arrange(entries, addresses, workspace):
         live = by_address(rep) if rep else None
         if live and workspace_of(live) != str(workspace):
             move_tile(rep, workspace)
+
+
+def boot_id():
+    """Which boot this is.
+
+    A lock file left by a crashed replay is stale — but its pid may well name
+    a live process again, because pids are handed out from the bottom on every
+    boot. The boot id is what tells the two apart.
+    """
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as fh:
+            return fh.read().strip()
+    except OSError:
+        return "?"
+
+
+def take_replay_lock():
+    """Refuse to start a replay while one is still running.
+
+    A second replay on top of the first is a stampede: it parks tiles the first
+    is still inserting, dissolves the groups the first has just built and moves
+    windows the other is about to place — so two presses of the keybinding can
+    leave the layout with nothing grouped at all and no way to tell why. The
+    lock names the process and the boot, so a crash cannot wedge it.
+    """
+    try:
+        with open(LOCK_PATH) as fh:
+            pid, boot, *_ = (fh.read().split() + ["", ""])
+    except OSError:
+        pid, boot = "", ""
+    if boot == boot_id() and pid.isdigit() and os.path.exists(f"/proc/{pid}"):
+        warn(f"a replay is already running (pid {pid}) — waiting for that one")
+        sys.exit(1)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(LOCK_PATH, "w") as fh:
+        fh.write(f"{os.getpid()} {boot_id()}")
+
+
+def drop_replay_lock():
+    try:
+        os.remove(LOCK_PATH)
+    except OSError:
+        pass
 
 
 def cmd_restore(args):
@@ -1316,6 +1546,11 @@ def cmd_restore(args):
 
     started = time.time()
     print(f"replaying {len(entries)} windows")
+    log_line(f"  file {args.file}  (saved {layout.get('saved_at')})")
+    log_line(f"  entries {len(entries)}, grouping {grouping}, "
+             f"arrange {not args.no_arrange}, spill {args.spill}, tuck {args.tuck}")
+    log_line(f"  live: {len(clients())} windows on "
+             f"ws{sorted({workspace_of(c) for c in clients()}, key=ws_sort_key)}")
     was_auto = auto_group() if grouping else False
     if grouping and was_auto:
         # Otherwise apps launched while a grouped window has focus join that
@@ -1335,20 +1570,27 @@ def cmd_restore(args):
         pool = existing_pool(args.force)
         plan = match_existing(pool, entries)
 
-        addresses, reused_flags, to_launch = {}, set(), []
+        addresses, to_launch, web_apps = {}, [], []
         for i, e in enumerate(entries):
             address = plan.get(i)
             if address:
-                reused_flags.add(i)
                 place(e, address)
                 addresses[i] = address
                 print(f"  {i + 1:2}. ws{e['workspace']:<6} {e['class']:<18} "
                       "(focused the window already open)")
+            elif is_webapp_window(e["class"]) and not args.force:
+                web_apps.append(e)
             else:
                 to_launch.append(i)
 
+        for e in web_apps:
+            warn(f"{e['class']}: the web app is not open, and a web app cannot be "
+                 f"relaunched from its command line (the save has the browser that "
+                 f"hosts it) — open it yourself, then restore again")
+
         if to_launch:
-            launched = launch_all([entries[i] for i in to_launch], args.delay)
+            launched, opened_unclaimed = launch_all(
+                [entries[i] for i in to_launch], args.delay)
             for slot, i in enumerate(to_launch):
                 addr = launched.get(slot)
                 addresses[i] = addr
@@ -1358,6 +1600,12 @@ def cmd_restore(args):
                           f"{' '.join(e['cmd'])[:52]}")
                 else:
                     warn(f"{e['class']} did not open a window")
+            if opened_unclaimed:
+                classes = sorted({cls for _addr, cls in opened_unclaimed})
+                print(f"  {len(opened_unclaimed)} window(s) opened while launching "
+                      f"did not match any entry: {', '.join(classes)}")
+        else:
+            opened_unclaimed = []
         if args.spill:
             moved = spill_strays(entries, addresses, args.spill)
             if moved:
@@ -1382,12 +1630,18 @@ def cmd_restore(args):
                     print(f"  OK   group of {len(idxs)}: "
                           f"{', '.join(e['class'] for e in group_entries)} (already correct)")
                 else:
+                    log_line(f"  group {gid}: entries {idxs} -> addresses {group_addrs}")
                     build_group(group_entries, group_addrs)
+        else:
+            log_line("  grouping off for this replay")
         if not args.no_arrange:
             for ws in dict.fromkeys(str(e["workspace"]) for e in entries):
                 idxs = [i for i, e in enumerate(entries) if str(e["workspace"]) == ws]
+                log_line(f"  arranging ws{ws}: entries {idxs}")
                 arrange([entries[i] for i in idxs],
                         {n: addresses.get(i) for n, i in enumerate(idxs)}, ws)
+        else:
+            log_line("  arrangement off for this replay")
 
     finally:
         if grouping and was_auto:
@@ -1445,8 +1699,8 @@ def report(entries, addresses):
 def verify(entries):
     """Diff the live window set against the snapshot by class + workspace."""
     from collections import Counter
-    have = Counter((c.get("class") or "?", workspace_of(c)) for c in clients())
-    want = Counter((e["class"], e["workspace"]) for e in entries)
+    have = Counter((family(c.get("class") or "?"), workspace_of(c)) for c in clients())
+    want = Counter((family(e["class"]), e["workspace"]) for e in entries)
     missing = want - have
     extra = have - want
     if not missing and not extra:
@@ -1456,6 +1710,20 @@ def verify(entries):
         print(f"  missing: {n}x {cls} on ws{ws}")
     for (cls, ws), n in extra.items():
         print(f"  extra:   {n}x {cls} on ws{ws}")
+
+
+def cmd_log(args):
+    """Print the trace of the last replay.
+
+    This is the point of the log: a replay from a keybinding has no terminal,
+    so when one fails this is the only record of what it did — every dispatch
+    and its reply, every window it matched, launched, grouped or failed to.
+    """
+    path = PREV_LOG_PATH if args.previous else LOG_PATH
+    if not os.path.exists(path):
+        sys.exit(f"hypr-layout: no run log at {path} yet")
+    with open(path) as fh:
+        sys.stdout.write(fh.read())
 
 
 def main():
@@ -1517,6 +1785,11 @@ def main():
     sh = sub.add_parser("show", help="print the saved layout")
     sh.set_defaults(func=cmd_show)
 
+    lg = sub.add_parser("log", help="show the last replay's trace")
+    lg.add_argument("--previous", action="store_true",
+                    help="the run before the last one")
+    lg.set_defaults(func=cmd_log)
+
     lst = sub.add_parser("layouts", help="list saved layouts")
     lst.set_defaults(func=cmd_layouts)
 
@@ -1531,8 +1804,35 @@ def main():
         ap.error("--spill moves strays away and --tuck folds them in — pick one")
     if getattr(args, "no_verify", False):
         args.verify = False
+    if args.cmd == "log":
+        cmd_log(args)             # needs neither a socket nor a running replay
+        return
     SOCKET_DIR = instance_dir()
-    args.func(args)
+    if args.cmd in ("save", "restore", "spill", "tuck"):
+        # Only a run that changes something logs; `show` and `layouts` must not
+        # push the trace of the replay you are trying to read out of the way.
+        log_open()
+        sys.stdout = Tee(sys.stdout)
+    log_line(f"hypr-layout {' '.join(sys.argv[1:])}   "
+             f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
+    log_line(f"  instance {SOCKET_DIR}")
+    locked = False
+    if args.cmd == "restore" and not getattr(args, "dry_run", False):
+        take_replay_lock()
+        locked = True
+    try:
+        args.func(args)
+    except SystemExit as exc:
+        log_line(f"  exited: {'cancelled' if exc.code is None else exc.code}")
+        raise
+    except BaseException:
+        # A traceback would otherwise die with the (usually absent) terminal.
+        log_line("  CRASHED:\n" + traceback.format_exc())
+        warn(f"crashed — trace written to {LOG_PATH}")
+        raise
+    finally:
+        if locked:
+            drop_replay_lock()
 
 
 if __name__ == "__main__":
