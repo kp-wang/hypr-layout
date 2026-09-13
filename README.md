@@ -194,6 +194,17 @@ whose window never opened, a workspace whose arrangement was skipped for want of
 a tile, a window that opened during the replay and could not be matched to
 anything.
 
+A group that cannot be built is taken back apart rather than left half-formed.
+That is not tidiness: a group of one is not a group, but it still draws a tab
+bar, and the arrangement pass moves a group as a single unit — so a workspace
+holding one is no longer the shape the save describes. The arrangement for that
+workspace is therefore skipped as well, and the tiling is left as it was found
+rather than rebuilt into something the save never had. (On 2026-09-13 one failed
+merge left exactly that state and the arrangement turned a working desktop into
+0/9.) For the same reason a merge never *keeps* a window it pulled into a
+neighbouring group by accident: the window is released again, so a layout can
+only gain a tab its own save asked for.
+
 Only one replay runs at a time. A second one started on top of the first parks
 tiles the first is still inserting and dissolves the groups it has just built —
 which is what a double-press of the keybinding looks like from the inside, and
@@ -210,6 +221,12 @@ should *not* be grouped comes back wrong. It also checks that the trace lands on
 disk and that a second concurrent replay is refused. It uses its own window
 class and cleans up after itself, but it does move windows, so run it when you
 are not mid-something.
+
+It is hermetic on purpose: it picks two workspaces that have nothing on them,
+switches the neighbour-group automation off while it runs, and puts your active
+workspace and that setting back on the way out. An earlier version ran its
+fixture on the user's own workspace, where one fixture window was merged into a
+live group — a test must never share a window tree it does not own.
 
 ```bash
 python3 tests/replay-check

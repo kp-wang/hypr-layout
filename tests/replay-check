@@ -42,6 +42,7 @@ spec.loader.exec_module(hl)
 hl.SOCKET_DIR = hl.instance_dir()
 
 results = []
+CLEANUP = []          # things to put back on the way out, even after a crash
 
 
 def check(label, ok, detail=""):
@@ -77,34 +78,74 @@ def entry(title, at, size, group=None, index=0, active=False):
             "cwd": "/tmp", "group": group, "group_index": index, "group_active": active}
 
 
+def free_workspace(taken):
+    """A numeric workspace with nothing on it, so the fixture cannot touch
+    anything of the user's.
+
+    The first version of this test put its windows on ws1 — the user's own
+    workspace — and one of them was merged into a *live* window group there,
+    which then travelled to the test's workspace with a tile move. A test that
+    builds and moves windows must not share a tree with anything it does not own.
+    """
+    used = {hl.workspace_of(c) for c in hl.clients()}
+    for name in ("9", "8", "10", "7", "11", "12", "6", "5"):
+        if name not in used and name not in taken:
+            return name
+    return None
+
+
 # A tile carrying a tab bar sits 28 px lower and is 28 px shorter than its bare
 # neighbour, which is what the compositor will produce — so the fixture uses
 # the rectangles a live session actually has, not idealised ones.
 TL, TR, BL, BR = (12, 40), (1927, 12), (12, 1066), (1927, 1066)
 GROUPED, BARE_TOP, BARE_BOTTOM = (1901, 1012), (1901, 1040), (1901, 1039)
-fixture = {"saved_at": "1970-01-01 00:00:00",
-           "monitors": [{"name": "DP-1", "mode": "3840x2160@60", "scale": 1}],
-           "entries": [entry("t1", TL, GROUPED, "gTL", 0, True),
-                       entry("t2", TL, GROUPED, "gTL", 1),
-                       entry("t3", TL, GROUPED, "gTL", 2),
-                       entry("t4", TR, BARE_TOP),
-                       entry("t5", BL, BARE_BOTTOM),
-                       entry("t6", BR, BARE_BOTTOM)]}
-saved = {e["title"]: e for e in fixture["entries"]}
-want_order = ["t1", "t2", "t3"]
+
+
+def build_fixture(ws):
+    def entry(title, at, size, group=None, index=0, active=False):
+        return {"class": CLS, "title": title, "workspace": ws, "floating": False,
+                "at": list(at), "size": list(size),
+                "cmd": ["foot", f"--app-id={CLS}", f"--title={title}", "-e", "sleep", "600"],
+                "cwd": "/tmp", "group": group, "group_index": index,
+                "group_active": active}
+
+    fixture = {"saved_at": "1970-01-01 00:00:00",
+               "monitors": [{"name": "DP-1", "mode": "3840x2160@60", "scale": 1}],
+               "entries": [entry("t1", TL, GROUPED, "gTL", 0, True),
+                           entry("t2", TL, GROUPED, "gTL", 1),
+                           entry("t3", TL, GROUPED, "gTL", 2),
+                           entry("t4", TR, BARE_TOP),
+                           entry("t5", BL, BARE_BOTTOM),
+                           entry("t6", BR, BARE_BOTTOM)]}
+    saved = {e["title"]: e for e in fixture["entries"]}
+    return fixture, saved, ["t1", "t2", "t3"]
 
 
 def main():
-    print("=== stage 1: six windows on ws1, scrambled, t5 and t6 never opened ===")
+    ws = free_workspace(set())
+    start_ws = free_workspace({ws} if ws else set())
+    if not ws or not start_ws:
+        print("skipped: needs two free workspaces (found "
+              f"{ws!r} and {start_ws!r}) — the test will not share a workspace "
+              "with your windows")
+        return 0
+    fixture, saved, want_order = build_fixture(ws)
+    was_ws = hl.json.loads(hl.sock_command("j/activeworkspace")).get("name", "1")
+    was_auto = hl.auto_group()
+    CLEANUP.append(lambda: hl.dispatch(f'hl.dsp.focus({{ workspace = "{was_ws}" }})'))
+    if was_auto:
+        CLEANUP.append(lambda: hl.set_auto_group(True))
+        hl.set_auto_group(False)
+
+    print(f"=== stage 1: six windows opened on ws{start_ws} (wrong on purpose), "
+          f"t5 and t6 never opened, replayed onto ws{ws} ===")
     wipe()
     json.dump(fixture, open(FIXTURE, "w"), indent=2)
-    for title in TITLES[:4]:
+    hl.dispatch(f'hl.dsp.focus({{ workspace = "{start_ws}" }})')   # so the new
+    time.sleep(0.3)                                                # windows open
+    for title in TITLES[:4]:                                       # off your tree
         spawn(title)
     time.sleep(2.5)
-    for client in mine().values():
-        hl.dispatch(f'hl.dsp.window.move({{ workspace = "1", follow = false, '
-                    f'window = "address:{client["address"]}" }})')
-    time.sleep(0.4)
 
     started = time.time()
     replay = run_tool("-f", FIXTURE, "restore", "--no-verify")
@@ -112,8 +153,8 @@ def main():
     print(replay.stdout.strip())
 
     windows = mine()
-    check("all six windows are back on ws10",
-          len(windows) == 6 and all(c["workspace"]["name"] == WS for c in windows.values()),
+    check(f"all six windows are back on ws{ws}",
+          len(windows) == 6 and all(c["workspace"]["name"] == ws for c in windows.values()),
           sorted((t, c["workspace"]["name"]) for t, c in windows.items()))
 
     wrong = []
@@ -178,4 +219,6 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     finally:
+        for step in reversed(CLEANUP):
+            step()
         wipe()

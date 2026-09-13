@@ -1218,10 +1218,8 @@ def _merge_into_group(anchor, addr, workspace):
     """Make `addr` a tab of the group that `anchor` is in.
 
     `into_group` only sees a group next door, so the window is parked and
-    re-inserted against the anchor with `preselect` first — that is what makes
-    the two neighbours. Trying the four directions from wherever the window
-    happens to be instead can grab a *different* adjacent group and scramble
-    two tiles at once.
+    re-inserted against the anchor with `preselect r` first — that is what makes
+    the two neighbours, and it is why the first direction tried below is `l`.
     """
     if not focus_checked(addr):
         return False
@@ -1244,8 +1242,19 @@ def _merge_into_group(anchor, addr, workspace):
     for direction in ("l", "r", "u", "d"):
         dispatch(f'hl.dsp.window.move({{ into_group = "{direction}" }})')
         time.sleep(0.06)
-        if anchor in ((by_address(addr) or {}).get("grouped") or []):
+        grouped = (by_address(addr) or {}).get("grouped") or []
+        if not grouped:
+            continue
+        if anchor in grouped:
             return True
+        # It landed in some *other* group — a neighbour this tile has nothing to
+        # do with. Take it straight back out: a direction scan that is allowed
+        # to leave a foreign group one tab heavier is how a window of one tile
+        # ends up riding inside another layout's group, and then moving that
+        # tile drags the foreign group along with it (observed 2026-09-13).
+        if focus_checked(addr):
+            dispatch("hl.dsp.window.move({ out_of_group = true })")
+            time.sleep(0.06)
     return False
 
 
@@ -1257,6 +1266,11 @@ def merge_into_group(anchor, addr, workspace, tries=3):
     attempt sometimes finds nothing to merge with — a second attempt starts
     from a different tree. Retrying costs two tenths of a second and turns a
     coin toss into a replay that groups reliably.
+
+    The retry re-runs the same insertion on purpose. Varying the preselect side
+    looked like an improvement and was not: it puts the returned window beside
+    whatever happens to be on that side, which is how a merge ends up reaching
+    for a neighbouring tunnel instead of the anchor.
     """
     for attempt in range(tries):
         if _merge_into_group(anchor, addr, workspace):
@@ -1267,7 +1281,13 @@ def merge_into_group(anchor, addr, workspace, tries=3):
 
 
 def build_group(entries, addresses):
-    """Form one window group from windows that are already placed."""
+    """Form one window group from windows that are already placed.
+
+    Returns True when the group ended up as the save describes it. On failure
+    it takes back the group it started, so the workspace is left as it was
+    found: a group of one is not a group, it still draws a tab bar, and it
+    gives the arrangement pass a tile container it cannot represent.
+    """
     members = [(e, a) for e, a in zip(entries, addresses) if a and by_address(a)]
     if len(members) < 2:
         # This used to return in silence, which is how a replay could end with
@@ -1277,11 +1297,11 @@ def build_group(entries, addresses):
         print(f"  FAIL group of {len(entries)}: "
               f"{'no window opened for ' + ', '.join(missing) if missing else 'fewer than two windows are up'}"
               " — nothing to group")
-        return
+        return False
     anchor = members[0][1]
     if not focus_checked(anchor):
         print(f"  FAIL group: cannot focus {entries[0]['class']}")
-        return
+        return False
     if (by_address(anchor) or {}).get("grouped"):
         dispatch("hl.dsp.window.move({ out_of_group = true })")
         time.sleep(0.1)
@@ -1304,6 +1324,21 @@ def build_group(entries, addresses):
     ok = all(anchor in ((by_address(a) or {}).get("grouped") or []) for _, a in members[1:])
     label = ", ".join(e["class"] for e, _ in members)
     print(f"  {'OK  ' if ok else 'FAIL'} group of {len(members)}: {label}")
+    if not ok:
+        release_group(members)
+        log_line(f"    dissolved the half-built group of {len(members)}")
+    return ok
+
+
+def release_group(members):
+    """Take these windows out of any group, leaving plain tiles behind."""
+    for _e, addr in members:
+        client = by_address(addr)
+        if not (client and client.get("grouped")):
+            continue
+        if focus_checked(addr):
+            dispatch("hl.dsp.window.move({ out_of_group = true })")
+            time.sleep(0.06)
 
 
 # ── arrangement ──────────────────────────────────────────────────────────────
@@ -1401,6 +1436,45 @@ def move_tile(address, workspace):
                     f'window = "address:{address}" }})')
 
 
+def one_unit(tile, addresses):
+    """True when this tile's windows are one thing to move — a group, or one window.
+
+    The arrangement parks and returns a tile with a single move, which carries
+    the whole group (measured 2026-09-13: the group's other tabs follow). What
+    it cannot carry is a tile whose windows are *not* grouped: half the tile
+    stays on the workspace, and the tree built after that has more leaves than
+    the save describes.
+    """
+    live = [c for c in (by_address(addresses[i]) for i in tile["indexes"]
+                        if addresses.get(i)) if c]
+    if len(live) < 2:
+        return True
+    gids = {(c.get("grouped") or [None])[0] for c in live}
+    return len(gids) == 1 and None not in gids
+
+
+def straddling_tile(tiles, addresses):
+    """The first tile whose group also holds a window belonging to another tile.
+
+    Moving a group moves all of it, so a tile that has picked up a window from
+    a different tile would drag that tile — and its group — along. That is how
+    a live window group was pulled across workspaces on 2026-09-13.
+    """
+    owner = {}
+    for n, tile in enumerate(tiles):
+        for i in tile["indexes"]:
+            if addresses.get(i):
+                owner[addresses[i]] = n
+    for n, tile in enumerate(tiles):
+        for i in tile["indexes"]:
+            client = by_address(addresses[i]) if addresses.get(i) else None
+            for member in (client or {}).get("grouped") or []:
+                other = owner.get(member)
+                if other is not None and other != n:
+                    return tile, member
+    return None, None
+
+
 def arrange(entries, addresses, workspace):
     """Rebuild one workspace's tiling so the tiles land in their saved rects."""
     tiles = [t for t in tiles_of(entries, addresses) if t["rect"]]
@@ -1413,8 +1487,26 @@ def arrange(entries, addresses, workspace):
             print(f"  skipped arrangement of ws{workspace}: no window for "
                   f"{', '.join(gone)} — the tiling was left as it is")
         return
+    loose = [t for t in tiles if not one_unit(t, addresses)]
+    if loose:
+        names = ", ".join(entries[t["indexes"][0]]["class"] for t in loose)
+        print(f"  skipped arrangement of ws{workspace}: {names} is not one "
+              f"group — the tiling was left as it is")
+        log_line(f"    ws{workspace}: arrangement skipped, not one unit: {names}")
+        return
+    bad, member = straddling_tile(tiles, addresses)
+    if bad:
+        name = entries[bad["indexes"][0]]["class"]
+        print(f"  skipped arrangement of ws{workspace}: {name} shares a group "
+              f"with another tile, so moving it would drag that tile along — "
+              f"the tiling was left as it is")
+        log_line(f"    ws{workspace}: arrangement skipped, group straddles two "
+                 f"tiles ({name} <- {member})")
+        return
     tree = arrange_tree([(t["rect"], n) for n, t in enumerate(tiles)])
     log_line(f"    ws{workspace}: {len(tiles)} tiles, tree {json.dumps(tree)}")
+    log_line(f"    ws{workspace}: tiles " +
+             ", ".join(f"{t['indexes']}@{t['rect']}" for t in tiles))
 
     # Park every tile off the workspace first: an empty workspace has no tree,
     # and the build below needs to start from nothing.
@@ -1618,6 +1710,14 @@ def cmd_restore(args):
                 print(f"  tucked {len(tucked)} window(s) not in this layout into "
                       "the top-left tile")
         dissolve_solo_groups(entries, addresses)
+        # Workspaces whose groups are not the saved ones. The arrangement tiles
+        # a group as one unit, so a group that failed to form leaves the
+        # workspace in a shape the arrangement cannot represent — and rebuilding
+        # a tree from it scrambles the workspace instead of restoring it. That
+        # is not theoretical: on 2026-09-13 one failed merge (a solo group next
+        # to its loose partner) produced a five-unit workspace where the save
+        # had four, and the arrangement turned a working desktop into 0/9.
+        ungrouped = set()
         if grouping:
             for gid in dict.fromkeys(e.get("group") for e in entries if e.get("group")):
                 idxs = [i for i, e in enumerate(entries) if e.get("group") == gid]
@@ -1631,12 +1731,23 @@ def cmd_restore(args):
                           f"{', '.join(e['class'] for e in group_entries)} (already correct)")
                 else:
                     log_line(f"  group {gid}: entries {idxs} -> addresses {group_addrs}")
-                    build_group(group_entries, group_addrs)
+                    if not build_group(group_entries, group_addrs):
+                        ungrouped.update(str(e["workspace"]) for e in group_entries)
         else:
             log_line("  grouping off for this replay")
+            # --no-groups gives up the arrangement for those windows too, as the
+            # README has always said: the save's tiles *are* groups, so arranging
+            # them as loose windows builds a shape the save never had.
+            ungrouped.update(str(e["workspace"]) for e in entries if e.get("group"))
         if not args.no_arrange:
             for ws in dict.fromkeys(str(e["workspace"]) for e in entries):
                 idxs = [i for i, e in enumerate(entries) if str(e["workspace"]) == ws]
+                if ws in ungrouped:
+                    print(f"  skipped arrangement of ws{ws}: the saved groups are "
+                          f"not in place, so these are not the saved tiles — the "
+                          f"tiling was left alone")
+                    log_line(f"  arranging ws{ws}: SKIPPED (groups not in place)")
+                    continue
                 log_line(f"  arranging ws{ws}: entries {idxs}")
                 arrange([entries[i] for i in idxs],
                         {n: addresses.get(i) for n, i in enumerate(idxs)}, ws)
