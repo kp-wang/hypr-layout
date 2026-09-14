@@ -88,7 +88,6 @@ PREV_LOG_PATH = os.path.join(STATE_DIR, "previous-run.log")
 LOCK_PATH = os.path.join(STATE_DIR, "replay.lock")
 HISTORY_KEEP = 5          # earlier saves kept per layout
 LAUNCH_IDLE = 4.0         # seconds without a window before a launch is given up on
-WORKSPACE_RANGE = 10      # numeric workspaces offered (Hyprland has no fixed count)
 SPILL_WORKSPACE = 5       # where `--spill` and `spill` park windows by default
 PROGRESS_CLASS = "hypr-layout-progress"   # our own overlay: never a window to manage
 HOME = os.path.expanduser("~")
@@ -514,21 +513,44 @@ def pick_layout():
     sys.exit(f"hypr-layout: no layout named {choice!r}")
 
 
+def live_workspaces():
+    """The workspaces that exist — the same list the bar shows.
+
+    Read from the compositor rather than counted out in a range: Omarchy's bar
+    widget is built from Hyprland.workspaces, so this is literally the list on
+    screen. Offering ten numbers when one workspace exists is a question with
+    obvious filler in it, and the ninth row is where a mis-keyed answer lands.
+
+    A workspace that does not exist yet is still reachable — switch to it once
+    (which creates it), then pick it here. `--workspace N` remains for scripts.
+    """
+    try:
+        workspaces = json.loads(sock_command("j/workspaces"))
+    except (ValueError, TypeError):
+        workspaces = []
+    names = {str(ws.get("name") or "") for ws in workspaces
+             if isinstance(ws, dict) and int(ws.get("id", 0)) > 0}
+    return sorted(names - {""}, key=ws_sort_key)
+
+
+def workspace_rows(layout):
+    """The rows `Where should it go?` offers: keep the saved place, or a live one."""
+    live = live_workspaces()
+    rows = [("keep as saved", "everything back on its own workspace")]
+    busy = {workspace_of(c) for c in clients()}
+    for ws in live:
+        here = " (has windows)" if ws in busy else ""
+        rows.append((ws, f"move everything to ws{ws}{here}"))
+    return rows
+
+
 def pick_workspace(layout, label):
     """Which workspace? 'keep as saved' keeps the workspaces the layout recorded.
 
-    The numeric list is the full range you can key to, not just the workspaces
-    that happen to exist: Hyprland creates a workspace the moment a window is
-    moved to it, so a number that does not exist yet is still a valid answer.
+    The list is the workspaces that exist, which is what the bar offers to
+    switch to — see live_workspaces().
     """
-    saved = {str(e["workspace"]) for e in layout["entries"]}
-    live = {workspace_of(c) for c in clients()}
-    spaces = {str(n) for n in range(1, WORKSPACE_RANGE + 1)} | saved | live
-    rows = [("keep as saved", "everything back on its own workspace")]
-    for ws in sorted(spaces, key=ws_sort_key):
-        here = " (has windows)" if ws in live else ""
-        rows.append((ws, f"move everything to ws{ws}{here}"))
-    choice = menu_pick("Where should it go?", rows)
+    choice = menu_pick("Where should it go?", workspace_rows(layout))
     if not choice:
         sys.exit("hypr-layout: cancelled")
     return choice

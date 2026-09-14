@@ -101,13 +101,14 @@ menus use (falling back to wofi, rofi, fuzzel, dmenu):
 Where should it go?
   keep as saved     everything back on its own workspace
   1                 move everything to ws1 (has windows)
-  2                 move everything to ws2
-  …
+  3                 move everything to ws3
 ```
 
-Workspaces 1–10 are offered whether or not they exist yet — Hyprland creates a
-workspace the moment a window lands on it, so a number that is still empty is a
-valid answer. With more than one layout saved, the layout is asked for first.
+The rows are the workspaces that exist — read from the compositor, which is the same
+list the bar's workspace indicator is built from, so it is the list already on screen.
+To send a layout to a workspace that does not exist yet, switch to it once (which
+creates it) and pick it here; `--workspace N` remains for scripts. With more than one
+layout saved, the layout is asked for first.
 
 ## Going back a save
 
