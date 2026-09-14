@@ -89,6 +89,8 @@ LOCK_PATH = os.path.join(STATE_DIR, "replay.lock")
 HISTORY_KEEP = 5          # earlier saves kept per layout
 LAUNCH_IDLE = 4.0         # seconds without a window before a launch is given up on
 SPILL_WORKSPACE = 5       # where `--spill` and `spill` park windows by default
+BAR_WORKSPACES = 5        # the bar's indicator always shows 1..5 (dimmed while empty)
+WORKSPACE_MAX = 10        # ...and adds any workspace up to this that does exist
 PROGRESS_CLASS = "hypr-layout-progress"   # our own overlay: never a window to manage
 HOME = os.path.expanduser("~")
 # Never replayed: transient or WM-internal surfaces.
@@ -514,23 +516,29 @@ def pick_layout():
 
 
 def live_workspaces():
-    """The workspaces that exist — the same list the bar shows.
+    """The workspaces the bar offers to switch to: 1-5, plus any that exist.
 
-    Read from the compositor rather than counted out in a range: Omarchy's bar
-    widget is built from Hyprland.workspaces, so this is literally the list on
-    screen. Offering ten numbers when one workspace exists is a question with
-    obvious filler in it, and the ninth row is where a mis-keyed answer lands.
+    Omarchy's workspace indicator is not a list of what exists — it always shows
+    1 to 5 (dimmed while empty) and adds any existing workspace above that, up
+    to 10. This mirrors it, so `Where should it go?` offers the same list that
+    is already on screen to click, and nothing else: ten rows was a question
+    with filler in it, and only the existing ones is not a question at all.
 
     A workspace that does not exist yet is still reachable — switch to it once
-    (which creates it), then pick it here. `--workspace N` remains for scripts.
+    (which creates it) and it appears here. `--workspace N` remains for scripts.
     """
+    names = {str(n) for n in range(1, BAR_WORKSPACES + 1)}
     try:
         workspaces = json.loads(sock_command("j/workspaces"))
     except (ValueError, TypeError):
         workspaces = []
-    names = {str(ws.get("name") or "") for ws in workspaces
-             if isinstance(ws, dict) and int(ws.get("id", 0)) > 0}
-    return sorted(names - {""}, key=ws_sort_key)
+    for ws in workspaces:
+        if not isinstance(ws, dict):
+            continue
+        ws_id = int(ws.get("id", 0))
+        if 1 <= ws_id <= WORKSPACE_MAX:
+            names.add(str(ws.get("name") or ws_id))
+    return sorted(names, key=ws_sort_key)
 
 
 def workspace_rows(layout):

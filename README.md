@@ -104,11 +104,12 @@ Where should it go?
   3                 move everything to ws3
 ```
 
-The rows are the workspaces that exist — read from the compositor, which is the same
-list the bar's workspace indicator is built from, so it is the list already on screen.
-To send a layout to a workspace that does not exist yet, switch to it once (which
-creates it) and pick it here; `--workspace N` remains for scripts. With more than one
-layout saved, the layout is asked for first.
+The rows mirror the bar's workspace indicator: 1 to 5 always — the bar draws them
+dimmed while they are empty — plus any other workspace that exists, up to 10. So the
+list you pick from is the list already on screen. To send a layout to a workspace that
+does not exist yet, switch to it once (which creates it) and it appears here;
+`--workspace N` remains for scripts. With more than one layout saved, the layout is
+asked for first.
 
 ## Going back a save
 
