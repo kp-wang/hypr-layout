@@ -211,6 +211,10 @@ def raw_clients():
     return json.loads(sock_command("j/clients"))
 
 
+def monitors():
+    return json.loads(sock_command("j/monitors"))
+
+
 def is_overlay(client):
     return any(PROGRESS_CLASS in str(client.get(key) or "")
                for key in ("class", "initialClass"))
@@ -1089,15 +1093,18 @@ class Progress:
     it) and clients() hides it from everything that manages windows.
     """
 
+    BANNER = ('printf "\\n\\n    hypr-layout — replaying your layout\\n'
+              '\\n    this window follows the run log and closes when the layout is back\\n'
+              '\\n"; tail -F -n +1 %s' % shlex.quote(str(LOG_PATH)))
+
     TERMINALS = (
-        ("foot", ["-a", PROGRESS_CLASS, "-T", "hypr-layout", "-W", "64x10",
-                  "tail", "-F", "-n", "+1"]),
+        ("foot", ["-a", PROGRESS_CLASS, "-T", "hypr-layout", "sh", "-c", BANNER]),
         ("alacritty", ["--class", PROGRESS_CLASS, "-t", "hypr-layout",
-                       "-e", "tail", "-F", "-n", "+1"]),
+                       "-e", "sh", "-c", BANNER]),
         ("kitty", ["--class", PROGRESS_CLASS, "-T", "hypr-layout",
-                   "tail", "-F", "-n", "+1"]),
+                   "sh", "-c", BANNER]),
         ("ghostty", ["--class", PROGRESS_CLASS, "-t", "hypr-layout",
-                     "-e", "tail", "-F", "-n", "+1"]),
+                     "-e", "sh", "-c", BANNER]),
     )
 
     RULE = ('hl.window_rule({ match = { class = "%s" }, float = true, '
@@ -1118,7 +1125,7 @@ class Progress:
                 continue
             try:
                 self.proc = subprocess.Popen(
-                    [binary, *args, str(LOG_PATH)], start_new_session=True,
+                    [binary, *args], start_new_session=True,
                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL)
                 break
@@ -1137,9 +1144,46 @@ class Progress:
             self.stop()
             self.say(message)
             return
-        log_line("  progress window up (floating, never focused)")
+        if not self.cover_screen():
+            log_line("  overlay would not cover the screen — left floating")
+            print("  warning: the progress window could not cover the screen")
+        log_line("  progress window up (covering the screen, never focused)")
         self.say(message)
         self.say("nothing is wrong — let it finish")
+
+    def cover_screen(self, tries=3):
+        """Cover the monitor with the overlay while the layout is rebuilt.
+
+        The windows underneath are about to be parked, moved and re-tiled, and a
+        replay that gets clicked halfway through is a replay that failed for no
+        good reason — a screen full of "replaying" is also the plainest way to
+        say *don't touch anything yet*.
+
+        Resized and moved rather than fullscreened, for two reasons measured on
+        this build: `hl.dsp.window.fullscreen({ mode = "fullscreen" })` answers
+        `ok` and changes nothing (only `maximized` takes), and every dispatcher
+        here acts on the *focused* window, which the overlay deliberately never
+        is. A screen-sized float has the property fullscreen could not give us
+        anyway — the overlay is pinned, so it stays on screen even while the
+        replay moves the view between workspaces.
+        """
+        monitor = (monitors() or [{}])[0]
+        width = int(monitor.get("width", 1920))
+        height = int(monitor.get("height", 1080))
+        for _ in range(tries):
+            client = next((c for c in raw_clients() if is_overlay(c)), None)
+            if client is None:
+                return False
+            size = client.get("size") or [0, 0]
+            if size[0] >= width and size[1] >= height and (client.get("at") or [0, 0]) == [0, 0]:
+                return True
+            address = client["address"]
+            dispatch(f'hl.dsp.window.resize({{ x = {width}, y = {height}, '
+                     f'window = "address:{address}" }})')
+            dispatch(f'hl.dsp.window.move({{ x = 0, y = 0, '
+                     f'window = "address:{address}" }})')
+            time.sleep(0.35)
+        return False
 
     def install_rule(self):
         """Ask the compositor to float the overlay and never focus it.

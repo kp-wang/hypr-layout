@@ -207,10 +207,13 @@ merge left exactly that state and the arrangement turned a working desktop into
 neighbouring group by accident: the window is released again, so a layout can
 only gain a tab its own save asked for.
 
-A replay announces itself while it runs: a small window follows the run log
-(floating and never focused, so it stays out of the very tiling it describes),
-and every phase also goes to the desktop as a one-line OSD. `--no-progress`
-turns both off.
+A replay announces itself while it runs: a full-screen window follows the run log
+— the line on screen is the step happening — and every phase also goes to the
+desktop as a one-line OSD, with the result at the end. The window is floated,
+pinned and never focused by a window rule, so it stays out of the very tiling it
+describes, cannot pull the focus out from under the arrangement, and stays on
+screen even while the replay moves the view between workspaces. `--no-progress`
+turns it and the OSD off.
 
 Two things it waits for before it touches a group. A window exists long before
 its application is done with it, so a replay waits until the windows it launched
