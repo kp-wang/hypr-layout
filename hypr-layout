@@ -84,6 +84,7 @@ LAYOUT_DIR = os.path.expanduser("~/.config/hypr/layouts")
 LAYOUT_HISTORY = os.path.expanduser("~/.config/hypr/layout-history")
 STATE_DIR = os.path.expanduser("~/.local/state/hypr-layout")
 LOG_PATH = os.path.join(STATE_DIR, "last-run.log")
+PROGRESS_PATH = os.path.join(STATE_DIR, "progress.json")
 PREV_LOG_PATH = os.path.join(STATE_DIR, "previous-run.log")
 LOCK_PATH = os.path.join(STATE_DIR, "replay.lock")
 HISTORY_KEEP = 5          # earlier saves kept per layout
@@ -1093,34 +1094,39 @@ class Progress:
     it) and clients() hides it from everything that manages windows.
     """
 
-    BANNER = ('printf "\\n\\n    hypr-layout — replaying your layout\\n'
-              '\\n    this window follows the run log and closes when the layout is back\\n'
-              '\\n"; tail -F -n +1 %s' % shlex.quote(str(LOG_PATH)))
-
-    TERMINALS = (
-        ("foot", ["-a", PROGRESS_CLASS, "-T", "hypr-layout", "sh", "-c", BANNER]),
-        ("alacritty", ["--class", PROGRESS_CLASS, "-t", "hypr-layout",
-                       "-e", "sh", "-c", BANNER]),
-        ("kitty", ["--class", PROGRESS_CLASS, "-T", "hypr-layout",
-                   "sh", "-c", BANNER]),
-        ("ghostty", ["--class", PROGRESS_CLASS, "-t", "hypr-layout",
-                     "-e", "sh", "-c", BANNER]),
-    )
+    def __init__(self, enabled=True, layout=None):
+        self.enabled = enabled
+        self.proc = None
+        self.rule = False
+        self.layout = layout
 
     RULE = ('hl.window_rule({ match = { class = "%s" }, float = true, '
             'pin = true, no_focus = true })' % PROGRESS_CLASS)
 
-    def __init__(self, enabled=True):
-        self.enabled = enabled
-        self.proc = None
-        self.rule = False
+    def command(self):
+        """The overlay's argv: this script, drawing this replay's progress.
+
+        Reusing the tool as its own progress screen keeps the promise of a
+        single stdlib file — nothing extra to install, and nothing to fall out
+        of step with the replay, because the screen and the run read the same
+        state.
+        """
+        ui = [sys.executable, os.path.abspath(__file__), "progress-ui"]
+        if self.layout:
+            ui += ["--layout", str(self.layout)]
+        return (
+            ("foot", ["-a", PROGRESS_CLASS, "-T", "hypr-layout", *ui]),
+            ("alacritty", ["--class", PROGRESS_CLASS, "-t", "hypr-layout", "-e", *ui]),
+            ("kitty", ["--class", PROGRESS_CLASS, "-T", "hypr-layout", *ui]),
+            ("ghostty", ["--class", PROGRESS_CLASS, "-t", "hypr-layout", "-e", *ui]),
+        )
 
     def start(self, message):
         log_line(f"  {message}")
         if not self.enabled or LOG_PATH is None:
             return
         self.rule = self.install_rule()
-        for binary, args in self.TERMINALS:
+        for binary, args in self.command():
             if not shutil.which(binary):
                 continue
             try:
@@ -1352,6 +1358,8 @@ def launch_all(entries, stagger):
         log_line(f"      -> entry {idx} {entries[idx]['class']!r} ({how})")
         place(entries[idx], address)
         addresses[idx] = address
+        # The overlay's diagram fills in as windows land, one box per window.
+        write_progress(placed=[i for i, a in addresses.items() if a])
     events.close()
     for i in sorted(unclaimed):
         log_line(f"    NO WINDOW for entry {i} {entries[i]['class']!r} "
@@ -1960,7 +1968,8 @@ def cmd_restore(args):
     grouping = any(e.get("group") for e in entries) and not args.no_groups
 
     started = time.time()
-    progress = Progress(enabled=not args.no_progress)
+    progress = Progress(enabled=not args.no_progress, layout=args.file)
+    write_progress(phase="reading the save", placed=[], total=len(entries))
     progress.start(f"replaying {len(entries)} windows — the log follows below")
     print(f"replaying {len(entries)} windows")
     log_line(f"  file {args.file}  (saved {layout.get('saved_at')})")
@@ -2000,6 +2009,8 @@ def cmd_restore(args):
             else:
                 to_launch.append(i)
 
+        write_progress(phase="launching what is missing",
+                       placed=[i for i, a in addresses.items() if a])
         for e in web_apps:
             warn(f"{e['class']}: the web app is not open, and a web app cannot be "
                  f"relaunched from its command line (the save has the browser that "
@@ -2030,6 +2041,8 @@ def cmd_restore(args):
             # Either way a group built on it fails and takes the workspace with
             # it, so wait for the windows to hold still first. This costs a few
             # hundred milliseconds and removes that whole failure.
+            write_progress(phase="waiting for windows to settle",
+                           placed=[i for i, a in addresses.items() if a])
             moving = settle_windows(entries, addresses)
             if moving:
                 progress.say(f"waited for {', '.join(moving)} to settle")
@@ -2052,6 +2065,8 @@ def cmd_restore(args):
         # is not theoretical: on 2026-09-13 one failed merge (a solo group next
         # to its loose partner) produced a five-unit workspace where the save
         # had four, and the arrangement turned a working desktop into 0/9.
+        write_progress(phase="rebuilding tab groups",
+                       placed=[i for i, a in addresses.items() if a])
         ungrouped = set()
         if grouping:
             for gid in dict.fromkeys(e.get("group") for e in entries if e.get("group")):
@@ -2089,6 +2104,7 @@ def cmd_restore(args):
                           f"tiling was left alone")
                     log_line(f"  arranging ws{ws}: SKIPPED (groups not in place)")
                     continue
+                write_progress(phase=f"arranging ws{ws}")
                 log_line(f"  arranging ws{ws}: entries {idxs}")
                 arrange([entries[i] for i in idxs],
                         {n: addresses.get(i) for n, i in enumerate(idxs)}, ws)
@@ -2171,6 +2187,157 @@ def verify(entries):
         print(f"  extra:   {n}x {cls} on ws{ws}")
 
 
+def read_progress():
+    """What the running replay has published, or {} when none has."""
+    try:
+        with open(PROGRESS_PATH) as fh:
+            state = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def write_progress(phase=None, placed=None, total=None):
+    """Publish what the run is doing, for the run's own screen to draw.
+
+    A small file rather than shared memory: the progress screen is a separate
+    process reading a few bytes ten times a second, and a file rewritten whole
+    cannot be read half-updated in a way that matters — the worst case is one
+    stale frame.
+    """
+    state = read_progress()
+    if phase is not None:
+        state["phase"] = str(phase)
+    if placed is not None:
+        state["placed"] = sorted(int(i) for i in placed)
+    if total is not None:
+        state["total"] = int(total)
+    try:
+        with open(PROGRESS_PATH, "w") as fh:
+            json.dump(state, fh)
+    except OSError:
+        pass
+
+
+def saved_screen(layout):
+    """Pixel size of the monitor a layout was saved on, for scaling a diagram."""
+    for monitor in layout.get("monitors") or []:
+        parts = str(monitor.get("mode") or "").split("x")
+        if len(parts) == 2:
+            height = parts[1].split("@")[0]
+            if parts[0].isdigit() and height.isdigit():
+                return int(parts[0]), int(height)
+    return 0, 0
+
+
+def cmd_progress_ui(args):
+    """The face of a replay: a spinner, the phase, and the layout filling in.
+
+    Runs inside the overlay terminal a replay opens, and reads the run state the
+    replay publishes, so what is on screen is what the run is doing. The saved
+    layout is drawn as a diagram — every window in the rectangle it belongs to —
+    and each one fills in as the replay places it, which makes the replay
+    legible instead of looking like the desktop being taken apart.
+
+    It ends when the terminal closes, which the replay does when the layout is
+    back: there is nothing to wait for on this side.
+    """
+    frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    bold, cyan, grey, reset = "\033[1m", "\033[38;5;45m", "\033[38;5;244m", "\033[0m"
+    try:
+        with open(args.layout) as fh:
+            layout = json.load(fh)
+    except (OSError, ValueError):
+        layout = {}
+    entries = layout.get("entries") or []
+    screen_w, screen_h = saved_screen(layout)
+    out = sys.stdout
+    tick = 0
+
+    def centred(text, style=""):
+        return " " * max(0, (shutil.get_terminal_size((120, 40)).columns - len(text)) // 2) \
+               + style + text + reset
+
+    while True:
+        state = read_progress()
+        placed = {int(i) for i in (state.get("placed") or []) if str(i).isdigit()}
+        size = shutil.get_terminal_size((120, 40))
+        cols = max(60, size.columns) - 2
+        rows = max(12, size.lines) - 7
+        canvas = [[" "] * cols for _ in range(rows)]
+        # Boxes follow *tiles*, not entries: a saved group is one tile with two
+        # or three windows on the same rectangle, so drawing per entry meant the
+        # last of them painted over the others — a tile with one window still
+        # missing came out empty. This is the same collapse the arrangement
+        # does, which is why the two agree on screen.
+        tiles = []
+        for i, entry in enumerate(entries):
+            key = entry.get("group")
+            tile = next((t for t in tiles if key and t["key"] == key), None)
+            if tile is None:
+                tile = {"key": key or f"entry{i}", "indexes": []}
+                tiles.append(tile)
+            tile["indexes"].append(i)
+        for tile in tiles:
+            first = entries[tile["indexes"][0]]
+            at, box = first.get("at"), first.get("size")
+            if not at or not box or not (screen_w and screen_h):
+                continue
+            left = max(0, min(cols - 3, int(at[0] / screen_w * cols)))
+            top = max(0, min(rows - 3, int(at[1] / screen_h * rows)))
+            right = max(left + 2, min(cols - 1, int((at[0] + box[0]) / screen_w * cols) - 1))
+            bottom = max(top + 2, min(rows - 1, int((at[1] + box[1]) / screen_h * rows) - 1))
+            done = all(i in placed for i in tile["indexes"])
+            for y in range(top + 1, bottom):
+                for x in range(left + 1, right):
+                    canvas[y][x] = "█" if done else " "
+            if done:
+                # Double lines once every window of the tile is in place, single
+                # while the replay is still working on it: shape rather than
+                # colour, so the diagram reads the same in any theme.
+                edges = ("═", "║", "╔", "╗", "╚", "╝")
+            else:
+                edges = ("─", "│", "┌", "┐", "└", "┘")
+            for x in range(left + 1, right):
+                canvas[top][x], canvas[bottom][x] = edges[0], edges[0]
+            for y in range(top + 1, bottom):
+                canvas[y][left], canvas[y][right] = edges[1], edges[1]
+            canvas[top][left], canvas[top][right] = edges[2], edges[3]
+            canvas[bottom][left], canvas[bottom][right] = edges[4], edges[5]
+            label = ", ".join(str(entries[i].get("class") or "") for i in tile["indexes"])
+            for n, ch in enumerate(label[: max(0, right - left - 2)]):
+                canvas[top + 1][left + 2 + n] = ch
+
+        total = state.get("total") or len(entries)
+        phase = str(state.get("phase") or "starting")
+        spin = frames[tick % len(frames)]
+
+        # The spinner and the phase sit in the middle of the diagram, over it:
+        # that is the thing to look at, and the boxes are the context around it.
+        badge = [f"{spin}  {phase}", f"{len(placed)} of {total} windows in place"]
+        badge_w = min(cols, max(len(line) for line in badge) + 8)
+        badge_x = max(0, (cols - badge_w) // 2)
+        badge_y = max(0, rows // 2 - 1)
+        for n, text in enumerate(badge):
+            if badge_y + n >= rows:
+                break
+            row = [" "] * badge_w
+            for m, ch in enumerate(text[: badge_w - 2]):
+                row[m + 3] = ch
+            canvas[badge_y + n][badge_x:badge_x + badge_w] = row
+
+        head = f"{spin}  replaying your layout"
+        frame = ["", centred(head, cyan + bold), ""]
+        frame += ["".join(row) for row in canvas]
+        out.write("\033[H")
+        for line in frame[: size.lines - 1]:
+            out.write(line + "\033[K\n")
+        out.write("\033[J")
+        out.flush()
+        tick += 1
+        time.sleep(0.1)
+
+
 def cmd_log(args):
     """Print the trace of the last replay.
 
@@ -2251,6 +2418,11 @@ def main():
     lg.add_argument("--previous", action="store_true",
                     help="the run before the last one")
     lg.set_defaults(func=cmd_log)
+
+    pu = sub.add_parser("progress-ui", help="the progress screen a replay shows")
+    pu.add_argument("--layout", default=LAYOUT,
+                    help="layout whose diagram is drawn (default the main one)")
+    pu.set_defaults(func=cmd_progress_ui)
 
     lst = sub.add_parser("layouts", help="list saved layouts")
     lst.set_defaults(func=cmd_layouts)
