@@ -205,6 +205,31 @@ merge left exactly that state and the arrangement turned a working desktop into
 neighbouring group by accident: the window is released again, so a layout can
 only gain a tab its own save asked for.
 
+A replay announces itself while it runs: a small window follows the run log
+(floating and never focused, so it stays out of the very tiling it describes),
+and every phase also goes to the desktop as a one-line OSD. `--no-progress`
+turns both off.
+
+Two things it waits for before it touches a group. A window exists long before
+its application is done with it, so a replay waits until the windows it launched
+have stopped resizing. And a window that is a fraction of the size of the tile
+the save describes — or floating where the save says tiled — is not that window:
+it is a dialog the app put up instead. A replay will not group it, because tab
+groups hold the real window and the attempts churn everything they move. That is
+not theory: on 2026-09-13 a replay relaunched eight apps, OBS opened with its
+"unclean shutdown detected" prompt, and three merge attempts against that 500x142
+dialog left the whole workspace scattered. Dismiss the dialog and restore again;
+the second run completes.
+
+A group that still fails is retried once after a pause, and if it fails again the
+arrangement for that workspace is skipped and says so — as above, a workspace
+whose groups are not the saved ones is not the saved shape. The arrangement also
+refuses to run when a workspace holds a different *number* of tiles than the save
+describes, whatever the reason (a stray, a window that opened mid-replay,
+something of ours left on screen): rebuilding a tree around an extra leaf splits
+tiles that should not be split, which is how one stray leaf halved all four tiles
+of a saved layout that same evening.
+
 Only one replay runs at a time. A second one started on top of the first parks
 tiles the first is still inserting and dissolves the groups it has just built —
 which is what a double-press of the keybinding looks like from the inside, and

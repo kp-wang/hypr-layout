@@ -90,6 +90,7 @@ HISTORY_KEEP = 5          # earlier saves kept per layout
 LAUNCH_IDLE = 4.0         # seconds without a window before a launch is given up on
 WORKSPACE_RANGE = 10      # numeric workspaces offered (Hyprland has no fixed count)
 SPILL_WORKSPACE = 5       # where `--spill` and `spill` park windows by default
+PROGRESS_CLASS = "hypr-layout-progress"   # our own overlay: never a window to manage
 HOME = os.path.expanduser("~")
 # Never replayed: transient or WM-internal surfaces.
 SKIP_CLASSES = {"hyprland", "xwaylandvideobridge"}
@@ -205,8 +206,24 @@ def dispatch(lua):
     return reply
 
 
-def clients():
+def raw_clients():
     return json.loads(sock_command("j/clients"))
+
+
+def is_overlay(client):
+    return any(PROGRESS_CLASS in str(client.get(key) or "")
+               for key in ("class", "initialClass"))
+
+
+def clients():
+    """Every window except our own progress overlay.
+
+    The overlay is a window like any other, so without this it would be matched
+    against an entry, spilled as a stray, or reported as an extra window on the
+    layout — a tool that trips over its own indicator is worse than no
+    indicator. Only Progress itself needs to see it, and it uses raw_clients().
+    """
+    return [c for c in raw_clients() if not is_overlay(c)]
 
 
 def by_address(addr):
@@ -556,7 +573,6 @@ def warn(message):
     the story is.
     """
     print(f"  warning: {message}")
-    log_line(f"  warning: {message}")
     if sys.stdout.isatty() or not shutil.which("notify-send"):
         return
     body = message if LOG is None else f"{message}\ntrace: {LOG_PATH}"
@@ -1027,6 +1043,128 @@ def spawn(entry):
         return None
 
 
+class Progress:
+    """Say that a replay is running, while it runs.
+
+    A replay is seconds of work — launching apps, waiting for them to settle,
+    rebuilding groups, rearranging tiles — and from the outside that is a
+    desktop being taken apart with nothing on screen saying why, which is how a
+    replay gets interrupted halfway and blamed for the result. So the run shows
+    a small window following its own log: the line on screen is the step
+    happening, and when a replay does go wrong that window is already the thing
+    to read. A one-line OSD per phase covers the runs where no terminal can be
+    started at all. Both go away when the run ends.
+
+    The overlay is a window, so it floats (the tiling must never make room for
+    it) and clients() hides it from everything that manages windows.
+    """
+
+    TERMINALS = (
+        ("foot", ["-a", PROGRESS_CLASS, "-T", "hypr-layout", "-W", "64x10",
+                  "tail", "-F", "-n", "+1"]),
+        ("alacritty", ["--class", PROGRESS_CLASS, "-t", "hypr-layout",
+                       "-e", "tail", "-F", "-n", "+1"]),
+        ("kitty", ["--class", PROGRESS_CLASS, "-T", "hypr-layout",
+                   "tail", "-F", "-n", "+1"]),
+        ("ghostty", ["--class", PROGRESS_CLASS, "-t", "hypr-layout",
+                     "-e", "tail", "-F", "-n", "+1"]),
+    )
+
+    RULE = ('hl.window_rule({ match = { class = "%s" }, float = true, '
+            'pin = true, no_focus = true })' % PROGRESS_CLASS)
+
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+        self.proc = None
+        self.rule = False
+
+    def start(self, message):
+        log_line(f"  {message}")
+        if not self.enabled or LOG_PATH is None:
+            return
+        self.rule = self.install_rule()
+        for binary, args in self.TERMINALS:
+            if not shutil.which(binary):
+                continue
+            try:
+                self.proc = subprocess.Popen(
+                    [binary, *args, str(LOG_PATH)], start_new_session=True,
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
+                break
+            except OSError:
+                continue
+        if self.proc is None:
+            log_line("  no terminal available for the progress window")
+            return
+        if not self.float_overlay():
+            # An overlay sitting in the tiling is one leaf more than the save
+            # describes, and one extra leaf is enough to halve every tile the
+            # arrangement builds (measured 2026-09-13: 941x1011 where the save
+            # said 1901x1011, on all four tiles). No indicator is better than a
+            # spoiled arrangement, so the window goes and the OSD carries it.
+            log_line("  overlay would not stay out of the tiling — closing it")
+            self.stop()
+            self.say(message)
+            return
+        log_line("  progress window up (floating, never focused)")
+        self.say(message)
+        self.say("nothing is wrong — let it finish")
+
+    def install_rule(self):
+        """Ask the compositor to float the overlay and never focus it.
+
+        A rule is better than a dispatch after the fact: the window arrives
+        already floating, so it is never a leaf in the dwindle tree, and never
+        focused, so it cannot pull the focus out from under the arrangement —
+        which applies `preselect` to whatever happens to be focused.
+        """
+        try:
+            reply = subprocess.run(["hyprctl", "eval", self.RULE],
+                                   capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return reply.returncode == 0
+
+    def float_overlay(self, tries=20):
+        """True once the compositor reports the overlay floating.
+
+        A dispatch covers compositors that do not take the rule; either way the
+        replay does not proceed until the overlay is out of the tiling.
+        """
+        for attempt in range(tries):
+            time.sleep(0.25)
+            client = next((c for c in raw_clients() if is_overlay(c)), None)
+            if client is None:
+                continue
+            if client.get("floating"):
+                return True
+            if not self.rule and attempt == 2:
+                dispatch('hl.dsp.window.float({ action = "enable", '
+                         f'window = "address:{client["address"]}" }})')
+        return False
+
+    def say(self, message, ms=2500):
+        """One phase, as an OSD line. The log line is what the window shows."""
+        if not self.enabled:
+            return
+        try:
+            subprocess.run(["hyprctl", "notify", "-1", str(ms), "0x33ccff",
+                            f"hypr-layout: {message}"],
+                           capture_output=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    def stop(self):
+        if self.proc is None:
+            return
+        try:
+            self.proc.terminate()
+        except OSError:
+            pass
+        self.proc = None
+
+
 def place(entry, address):
     """Put a window on its workspace (and float/resize it if the save says so)."""
     client = by_address(address)
@@ -1145,6 +1283,55 @@ def launch_all(entries, stagger):
         log_line(f"    NO WINDOW for entry {i} {entries[i]['class']!r} "
                  f"{entries[i]['title'][:44]!r}")
     return addresses, opened_unclaimed
+
+
+def settle_windows(entries, addresses, timeout=8.0, step=0.35):
+    """Wait until the windows we are about to group have stopped moving.
+
+    A window exists long before its application is done with it: it opens at
+    whatever size the toolkit asks for, then the app resizes, reparents or
+    replaces it, and a slow one can be mid-flight for seconds. Grouping a
+    window in that state is how a merge fails — and a failed merge churns every
+    window it touches, which is worse than not grouping at all.
+
+    On 2026-09-13 a replay relaunched eight apps and went straight into
+    building groups. OBS was still putting up its "unclean shutdown detected"
+    prompt, the three merge attempts ran against that dialog, and the desktop
+    was left scattered. Waiting for geometry to hold still across two samples
+    costs a few hundred milliseconds and removes the whole class of failure.
+
+    A window the save calls tiled but which is floating is a dialog, and no
+    amount of waiting makes it the window the save describes — that one is left
+    for build_group to refuse, so this returns only the ones still moving.
+    """
+    deadline = time.time() + timeout
+    previous = {}
+    announced = set()
+    while True:
+        moving = []
+        for i, e in enumerate(entries):
+            address = addresses.get(i)
+            client = by_address(address) if address else None
+            if client is None:
+                previous.pop(i, None)     # it never opened; nothing to wait for
+                continue
+            if bool(client.get("floating")) != bool(e.get("floating")):
+                continue                  # a dialog: waiting cannot fix that
+            state = (tuple(client.get("at") or ()), tuple(client.get("size") or ()))
+            if previous.get(i) != state:
+                moving.append((e, state))
+            previous[i] = state
+        if not moving:
+            return []
+        if time.time() >= deadline:
+            return [e["class"] for e, _state in moving]
+        for e, _state in moving:
+            if e["class"] in announced:
+                continue
+            announced.add(e["class"])
+            print(f"  waiting for {e['class']} to settle")
+            log_line(f"    settle: {e['class']} is still resizing")
+        time.sleep(step)
 
 
 def group_order(group_id):
@@ -1298,6 +1485,28 @@ def build_group(entries, addresses):
               f"{'no window opened for ' + ', '.join(missing) if missing else 'fewer than two windows are up'}"
               " — nothing to group")
         return False
+    # A member that is floating when the save says tiled, or that is a fraction
+    # of the size of the tile the save describes, is not the window the save
+    # describes — it is a dialog the app put up instead of its real window. Tab
+    # groups hold the real window, so the merge cannot take, and trying anyway
+    # churns everything it moves: on 2026-09-13 a replay relaunched eight apps,
+    # OBS opened with its "unclean shutdown detected" prompt, and three failed
+    # attempts against that 500x142 dialog left the workspace scattered.
+    # Refuse before touching anything, and say what to do about it.
+    dialogs = []
+    for e, a in members:
+        client = by_address(a)
+        if client is None or e.get("floating"):
+            continue
+        if client.get("floating") or looks_like_a_dialog(e, client):
+            dialogs.append(e["class"])
+    if dialogs:
+        print(f"  FAIL group of {len(entries)}: {', '.join(dialogs)} is showing a "
+              f"dialog, not the window the save describes — dismiss it and "
+              f"restore again")
+        log_line(f"    group refused: {', '.join(dialogs)} is a dialog, not the "
+                 f"saved window")
+        return False
     anchor = members[0][1]
     if not focus_checked(anchor):
         print(f"  FAIL group: cannot focus {entries[0]['class']}")
@@ -1328,6 +1537,29 @@ def build_group(entries, addresses):
         release_group(members)
         log_line(f"    dissolved the half-built group of {len(members)}")
     return ok
+
+
+def looks_like_a_dialog(entry, client):
+    """True when a "tiled" window is far smaller than the tile the save describes.
+
+    An app can hand the compositor a dialog before its real window exists — OBS
+    opens with its "unclean shutdown detected" prompt, which is 500x142 — and
+    the compositor tiles *that*. It is not the window the save describes, and
+    grouping it cannot work: on 2026-09-13 three merge attempts against exactly
+    that dialog left a whole workspace scattered. The comparison is loose on
+    purpose, because a tile is already as small as the split it sits in (the
+    save's tiles are quarters); a dialog is smaller than that by an order of
+    magnitude in both directions.
+    """
+    if entry.get("floating") or client.get("floating"):
+        return False
+    if not entry.get("size"):
+        return False
+    want_w, want_h = entry["size"]
+    width, height = client.get("size") or (0, 0)
+    if not (want_w and want_h):
+        return False
+    return width < want_w * 0.4 and height < want_h * 0.4
 
 
 def release_group(members):
@@ -1503,6 +1735,23 @@ def arrange(entries, addresses, workspace):
         log_line(f"    ws{workspace}: arrangement skipped, group straddles two "
                  f"tiles ({name} <- {member})")
         return
+    # How many tiles the workspace really has, as leaves of the dwindle tree —
+    # a group is one leaf however many windows are in it. If that is not the
+    # number of tiles in the save, there is something on this workspace the
+    # save does not know about (a stray, a window that opened mid-replay, an
+    # indicator of our own) and rebuilding a tree around it splits tiles that
+    # should not be split: on 2026-09-13 one extra leaf halved all four tiles
+    # of a saved layout (941x1011 where the save said 1901x1011). Leave the
+    # tiling alone instead — `--spill` and `--tuck` are what deal with strays.
+    leaves = {((c.get("grouped") or [c["address"]])[0])
+              for c in clients()
+              if workspace_of(c) == str(workspace) and not c.get("floating")}
+    if len(leaves) != len(tiles):
+        print(f"  skipped arrangement of ws{workspace}: {len(leaves)} tiles are on "
+              f"it where the save has {len(tiles)} — the tiling was left as it is")
+        log_line(f"    ws{workspace}: arrangement skipped, {len(leaves)} live "
+                 f"leaves vs {len(tiles)} saved tiles")
+        return
     tree = arrange_tree([(t["rect"], n) for n, t in enumerate(tiles)])
     log_line(f"    ws{workspace}: {len(tiles)} tiles, tree {json.dumps(tree)}")
     log_line(f"    ws{workspace}: tiles " +
@@ -1637,6 +1886,8 @@ def cmd_restore(args):
     grouping = any(e.get("group") for e in entries) and not args.no_groups
 
     started = time.time()
+    progress = Progress(enabled=not args.no_progress)
+    progress.start(f"replaying {len(entries)} windows — the log follows below")
     print(f"replaying {len(entries)} windows")
     log_line(f"  file {args.file}  (saved {layout.get('saved_at')})")
     log_line(f"  entries {len(entries)}, grouping {grouping}, "
@@ -1698,6 +1949,16 @@ def cmd_restore(args):
                       f"did not match any entry: {', '.join(classes)}")
         else:
             opened_unclaimed = []
+        if to_launch:
+            # The apps are up, but not necessarily done with their windows: a
+            # window can still be resizing, or be a dialog the app put up
+            # instead of its real one (OBS asks about an unclean shutdown).
+            # Either way a group built on it fails and takes the workspace with
+            # it, so wait for the windows to hold still first. This costs a few
+            # hundred milliseconds and removes that whole failure.
+            moving = settle_windows(entries, addresses)
+            if moving:
+                progress.say(f"waited for {', '.join(moving)} to settle")
         if args.spill:
             moved = spill_strays(entries, addresses, args.spill)
             if moved:
@@ -1732,7 +1993,13 @@ def cmd_restore(args):
                 else:
                     log_line(f"  group {gid}: entries {idxs} -> addresses {group_addrs}")
                     if not build_group(group_entries, group_addrs):
-                        ungrouped.update(str(e["workspace"]) for e in group_entries)
+                        # One bounded retry. A window that was still starting
+                        # often groups fine a second later, and a replay from a
+                        # keybinding should not need a second press to finish.
+                        time.sleep(1.2)
+                        if not build_group(group_entries, group_addrs):
+                            ungrouped.update(str(e["workspace"])
+                                             for e in group_entries)
         else:
             log_line("  grouping off for this replay")
             # --no-groups gives up the arrangement for those windows too, as the
@@ -1753,15 +2020,22 @@ def cmd_restore(args):
                         {n: addresses.get(i) for n, i in enumerate(idxs)}, ws)
         else:
             log_line("  arrangement off for this replay")
+        if ungrouped:
+            warn("nothing is half-grouped and the tiling was left exactly as it "
+                 "was found; dismiss anything that is showing a dialog, then "
+                 "restore again")
 
     finally:
         if grouping and was_auto:
             set_auto_group(True)
         if was_anim:
             set_animations(True)
+        progress.stop()
 
     ok, total = report(entries, addresses)
     print(f"{ok}/{total} windows placed correctly  ({time.time() - started:.1f}s)")
+    progress.say(f"{ok}/{total} windows placed correctly  "
+                 f"({time.time() - started:.1f}s)", ms=5000)
     if ok < total:
         warn(f"{total - ok} of {total} windows could not be placed")
     if args.verify:
@@ -1842,6 +2116,9 @@ def main():
     ap = argparse.ArgumentParser(prog="hypr-layout", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-f", "--file", default=LAYOUT, help=f"layout file (default {LAYOUT})")
+    ap.add_argument("--no-progress", action="store_true",
+                    help="do not show the progress window or the OSD lines while a "
+                         "replay runs")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("save", help="snapshot the current layout")

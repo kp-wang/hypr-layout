@@ -68,7 +68,10 @@ def wipe():
 
 
 def run_tool(*args):
-    return subprocess.run([sys.executable, TOOL, *args], capture_output=True, text=True)
+    # --no-progress: the test is about the layout, not about the overlay, and a
+    # stray terminal window per replay would only add noise to the fixture.
+    return subprocess.run([sys.executable, TOOL, "--no-progress", *args],
+                          capture_output=True, text=True)
 
 
 def entry(title, at, size, group=None, index=0, active=False):
@@ -179,7 +182,7 @@ def main():
         showing = sorted(t for t in want_order if windows[t]["visible"])
         check("the saved tab is the one showing", showing == ["t1"], showing)
     check("t4/t5/t6 are not grouped",
-          not any((windows[t].get("grouped") or []) for t in ("t4", "t5", "t6")),
+          not any((windows.get(t) or {}).get("grouped") for t in ("t4", "t5", "t6")),
           [windows[t].get("grouped") for t in ("t4", "t5", "t6")])
     check("the replay finished promptly", elapsed < 12, f"{elapsed:.1f}s")
     check("the replay reported every window", "/6 windows placed correctly" in replay.stdout,
