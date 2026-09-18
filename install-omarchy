@@ -1,0 +1,51 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+BIN_DIR=${XDG_BIN_HOME:-$HOME/.local/bin}
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/hypr-layout
+USER_UNIT_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
+HOOK_PATH=${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/hooks/post-boot.d/hypr-layout-restore
+
+if [[ ${1:-} == "--uninstall" ]]; then
+  systemctl --user disable --now hypr-layout-autosave.service 2>/dev/null || true
+  systemctl --user stop hypr-layout-restore.service 2>/dev/null || true
+  rm -f "$USER_UNIT_DIR/hypr-layout-autosave.service"
+  rm -f "$USER_UNIT_DIR/hypr-layout-restore.service"
+  rm -f "$HOOK_PATH"
+  rm -f "$BIN_DIR/hypr-layout"
+  systemctl --user daemon-reload
+  echo "Removed hypr-layout's Omarchy integration. Saved sessions remain in $STATE_DIR."
+  exit 0
+fi
+
+if (( $# != 0 )); then
+  echo "Usage: ./install-omarchy [--uninstall]" >&2
+  exit 2
+fi
+
+command -v omarchy >/dev/null || { echo "Omarchy is required." >&2; exit 1; }
+command -v hyprctl >/dev/null || { echo "Hyprland is required." >&2; exit 1; }
+
+install -Dm755 "$ROOT/hypr-layout" "$BIN_DIR/hypr-layout"
+install -Dm644 "$ROOT/contrib/omarchy/hypr-layout-autosave.service" \
+  "$USER_UNIT_DIR/hypr-layout-autosave.service"
+install -Dm644 "$ROOT/contrib/omarchy/hypr-layout-restore.service" \
+  "$USER_UNIT_DIR/hypr-layout-restore.service"
+omarchy hook install post-boot "$ROOT/contrib/omarchy/hypr-layout-restore"
+
+mkdir -p "$STATE_DIR"
+SESSION_FILE="$STATE_DIR/session.json"
+if [[ ! -f $SESSION_FILE ]] && hyprctl -j clients >/dev/null 2>&1; then
+  "$BIN_DIR/hypr-layout" -f "$SESSION_FILE" save --resume-terminals --if-changed
+fi
+
+systemctl --user daemon-reload
+systemctl --user enable --now hypr-layout-autosave.service
+
+echo
+echo "Installed macOS-style session restore for Omarchy."
+echo "Snapshot: $SESSION_FILE"
+echo "Autosave: systemctl --user status hypr-layout-autosave.service"
+echo "Restore log: $BIN_DIR/hypr-layout log"

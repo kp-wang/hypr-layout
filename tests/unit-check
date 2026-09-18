@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Small, dependency-free checks for session persistence helpers."""
+
+import json
+import os
+import runpy
+import tempfile
+import unittest
+
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MODULE = runpy.run_path(os.path.join(ROOT, "hypr-layout"), run_name="hypr_layout_test")
+
+
+class SessionPersistenceTests(unittest.TestCase):
+    def test_atomic_json_dump_replaces_valid_document(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "session.json")
+            MODULE["atomic_json_dump"](path, {"entries": [{"class": "foot"}]})
+            with open(path) as fh:
+                self.assertEqual(json.load(fh)["entries"][0]["class"], "foot")
+            self.assertEqual([name for name in os.listdir(folder) if name.endswith(".tmp")], [])
+
+    def test_same_snapshot_ignores_time_and_volatile_title(self):
+        old = {
+            "saved_at": "2026-09-18 10:00:00",
+            "monitors": [],
+            "entries": [{"class": "foot", "title": "spinner 1", "workspace": "3"}],
+        }
+        new = {
+            "saved_at": "2026-09-18 10:01:00",
+            "monitors": [],
+            "entries": [{"class": "foot", "title": "spinner 2", "workspace": "3"}],
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "session.json")
+            with open(path, "w") as fh:
+                json.dump(old, fh)
+            self.assertTrue(MODULE["same_snapshot"](path, new))
+            new["entries"][0]["workspace"] = "4"
+            self.assertFalse(MODULE["same_snapshot"](path, new))
+
+    def test_foot_resume_preserves_class_and_uses_child_directory(self):
+        fn = MODULE["resumable_foot_command"]
+        original = fn.__globals__["resumable_terminal_child"]
+        fn.__globals__["resumable_terminal_child"] = lambda _pid: ("codex", "/work/project", 999999)
+        try:
+            argv, cwd, resumed = fn(10, ["foot"], "/")
+        finally:
+            fn.__globals__["resumable_terminal_child"] = original
+        self.assertEqual(resumed, "codex")
+        self.assertEqual(cwd, "/work/project")
+        self.assertEqual(argv, ["foot", "--working-directory=/work/project", "-e",
+                                "codex", "resume", "--last"])
+
+    def test_monitor_shape_ignores_refresh_rate(self):
+        saved = [{"name": "eDP-1", "mode": "1280x800@60", "scale": 1}]
+        live = [{"name": "eDP-1", "width": 1280, "height": 800,
+                 "refreshRate": 59.99, "scale": 1.0}]
+        self.assertEqual(MODULE["monitor_shape"](saved), MODULE["monitor_shape"](live))
+
+    def test_codex_prefers_exact_open_session(self):
+        fn = MODULE["terminal_resume_command"]
+        original = fn.__globals__["codex_session_id"]
+        fn.__globals__["codex_session_id"] = lambda _pid: "session-123"
+        try:
+            command = fn("codex", 10)
+        finally:
+            fn.__globals__["codex_session_id"] = original
+        self.assertEqual(command, ["codex", "resume", "session-123"])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

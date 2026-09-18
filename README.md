@@ -9,6 +9,8 @@ hypr-layout save               # snapshot what is on screen now
 hypr-layout restore            # put everything back
 hypr-layout restore --pick     # pick a layout and a workspace from a menu
 hypr-layout save --name work   # keep more than one layout, side by side
+hypr-layout watch              # autosave stable desktop changes
+hypr-layout restore-login      # guarded restore for a login hook
 hypr-layout layouts            # what is saved, and how many earlier saves exist
 hypr-layout show               # print the saved snapshot
 ```
@@ -46,12 +48,49 @@ is verified by reading the compositor back rather than trusting an `ok`.
 
 ```bash
 mkdir -p ~/.local/bin
-curl -fsSL https://raw.githubusercontent.com/leftydevkit/hypr-layout/main/hypr-layout \
+curl -fsSL https://raw.githubusercontent.com/kp-wang/hypr-layout/main/hypr-layout \
   -o ~/.local/bin/hypr-layout
 chmod +x ~/.local/bin/hypr-layout
 ```
 
 Make sure `~/.local/bin` is on your `PATH`.
+
+### Automatic session restore on Omarchy
+
+Clone the repository and run the installer:
+
+```bash
+git clone https://github.com/kp-wang/hypr-layout.git
+cd hypr-layout
+./install-omarchy
+```
+
+This installs only user-owned files. It creates:
+
+- `~/.local/bin/hypr-layout`;
+- `hypr-layout-autosave.service`, which saves five seconds after the desktop
+  becomes stable and refuses to replace a snapshot with an empty teardown;
+- `hypr-layout-restore.service`, which restores snapshots no older than 24
+  hours and falls back to workspace-only placement if the monitor topology
+  changed; and
+- an Omarchy `post-boot` hook that starts the restore without blocking other
+  hooks.
+
+The session snapshot is `~/.local/state/hypr-layout/session.json`. Password
+manager window classes are excluded by default. Floating windows are not
+autosaved because transient dialogs are floating too; manual `save --floating`
+remains available.
+
+The watcher starts its first save after 45 seconds, leaving the login restore
+time to finish. During Omarchy shutdown every window closes within roughly two
+seconds; the five-second debounce therefore keeps the last stable, non-empty
+snapshot instead of recording the teardown.
+
+Remove the integration while retaining saved sessions with:
+
+```bash
+./install-omarchy --uninstall
+```
 
 ## Usage
 
@@ -81,6 +120,22 @@ hypr-layout log                     # print the last run's trace (`--previous` f
 | `--delay S` | stagger launches by `S` seconds (default `0`: all at once) |
 | `-f FILE` | use a different layout file |
 | `--floating` (on `save`) | also capture floating windows, with their size and position |
+
+### Terminal application recovery
+
+Hyprland normally sees only the terminal process, not the program inside it.
+`save --resume-terminals` and the Omarchy watcher inspect Foot's child process
+tree using `/proc`, but only recover an explicit safe allowlist:
+
+- Claude Code becomes `claude --continue`;
+- Codex resumes the exact session JSONL held open by that TUI, falling back to
+  `codex resume --last` when no session has been established yet;
+- btop and htop are relaunched normally.
+
+The restored command retains Foot's app-id and working directory, so its window
+still matches the saved class. This restores application sessions, not process
+memory. Multiple Claude or Codex sessions in the same directory remain
+ambiguous, and arbitrary shell commands are deliberately never replayed.
 
 ## More than one layout
 
@@ -285,7 +340,8 @@ o.bind("SUPER + SHIFT + ALT + S", "Send window to ws5", "/home/USER/.local/bin/h
 
 A row needs its leading glyph: without one the menu draws the label clipped.
 
-Replay at login (`~/.config/hypr/autostart.lua`):
+For a fixed manual layout, replay at login can still be added to
+`~/.config/hypr/autostart.lua`:
 
 ```lua
 o.launch_on_start("bash -c 'sleep 8; ~/.local/bin/hypr-layout restore --no-verify'")
@@ -294,6 +350,10 @@ o.launch_on_start("bash -c 'sleep 8; ~/.local/bin/hypr-layout restore --no-verif
 The sleep lets the session settle before the replay starts moving windows. There is no
 redirect: a login-time replay has nowhere to print, which is exactly why the run log
 exists — `hypr-layout log` reads back what it did.
+
+For macOS-style “reopen what was there before restart,” use `./install-omarchy`
+instead. Its event-driven watcher, empty-session guard, restore age limit and
+post-boot service are designed for a changing session rather than a fixed layout.
 
 ## Where it fits
 

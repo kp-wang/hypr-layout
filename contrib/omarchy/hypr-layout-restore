@@ -1,0 +1,5 @@
+#!/bin/bash
+
+# Omarchy post-boot hook: hand the delayed restore to the user service manager
+# so other post-boot hooks are not blocked while applications reopen.
+systemctl --user start --no-block hypr-layout-restore.service

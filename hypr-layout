@@ -74,6 +74,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -96,6 +97,21 @@ PROGRESS_CLASS = "hypr-layout-progress"   # our own overlay: never a window to m
 HOME = os.path.expanduser("~")
 # Never replayed: transient or WM-internal surfaces.
 SKIP_CLASSES = {"hyprland", "xwaylandvideobridge"}
+AUTOSAVE_EVENTS = {
+    "openwindow", "closewindow", "movewindow", "movewindowv2",
+    "changefloatingmode", "fullscreen", "moveworkspace", "moveworkspacev2",
+    "togglegroup", "moveintogroup", "moveoutofgroup", "movegroupwindow",
+    "monitoradded", "monitoraddedv2", "monitorremoved", "pin",
+    # This is normally just focus churn, but it also records which tab of a
+    # Hyprland group was visible when the session became idle.
+    "activewindowv2",
+}
+TERMINAL_RESUME = {
+    "claude": ["claude", "--continue"],
+    "codex": ["codex", "resume", "--last"],
+    "btop": ["btop"],
+    "htop": ["htop"],
+}
 
 
 # ── the run log ──────────────────────────────────────────────────────────────
@@ -445,6 +461,53 @@ def keep_history(path, keep=HISTORY_KEEP):
         os.remove(os.path.join(LAYOUT_HISTORY, name))
 
 
+def atomic_json_dump(path, value):
+    """Durably replace a snapshot without leaving half-written JSON on loss."""
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".hypr-layout-", suffix=".tmp", dir=parent)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(value, fh, indent=2)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temporary, path)
+        try:
+            directory = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except OSError:
+            pass
+    finally:
+        try:
+            os.remove(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def same_snapshot(path, layout):
+    """True when only the human-readable save timestamp would change."""
+    try:
+        with open(path) as fh:
+            previous = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return False
+    def stable(value):
+        result = {k: v for k, v in value.items() if k != "saved_at"}
+        # Titles are matching hints, not layout. Spinners, clocks and browser
+        # tabs change them constantly and should not consume snapshot history.
+        result["entries"] = [
+            {k: v for k, v in entry.items() if k != "title"}
+            for entry in result.get("entries", [])
+        ]
+        return result
+
+    return stable(previous) == stable(layout)
+
+
 def history_files(path):
     """Earlier saves of one layout, newest first."""
     if not os.path.isdir(LAYOUT_HISTORY):
@@ -634,6 +697,119 @@ def client_cmd(pid):
     return split_command(argv), cwd
 
 
+def process_cmd(pid):
+    """Return argv for one process without letting /proc races escape."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            return [a.decode(errors="replace") for a in fh.read().split(b"\0") if a]
+    except OSError:
+        return []
+
+
+def process_children(pid):
+    """Direct process children, using the kernel's race-tolerant children list."""
+    try:
+        with open(f"/proc/{pid}/task/{pid}/children") as fh:
+            return [int(child) for child in fh.read().split()]
+    except (OSError, ValueError):
+        return []
+
+
+def resumable_terminal_child(pid):
+    """Find the nearest allowlisted foreground-style program below a terminal.
+
+    A Wayland client only exposes the terminal process to Hyprland. For a Foot
+    window started as a plain shell, the useful process is usually two levels
+    down (foot -> shell -> codex). Only a deliberately small allowlist is
+    considered: replaying an arbitrary descendant command after reboot would
+    be surprising and, for one-shot shell commands, potentially dangerous.
+    """
+    pending = list(process_children(pid))
+    seen = set()
+    while pending:
+        child = pending.pop(0)
+        if child in seen:
+            continue
+        seen.add(child)
+        argv = process_cmd(child)
+        name = os.path.basename(argv[0]) if argv else ""
+        if name in TERMINAL_RESUME:
+            try:
+                cwd = os.readlink(f"/proc/{child}/cwd")
+            except OSError:
+                cwd = None
+            return name, cwd, child
+        pending.extend(process_children(child))
+    return None, None, None
+
+
+def codex_session_id(pid):
+    """Read the exact Codex session id from the JSONL the TUI keeps open."""
+    try:
+        descriptors = os.listdir(f"/proc/{pid}/fd")
+    except OSError:
+        return None
+    for descriptor in descriptors:
+        try:
+            path = os.readlink(f"/proc/{pid}/fd/{descriptor}")
+        except OSError:
+            continue
+        if "/.codex/sessions/" not in path or not path.endswith(".jsonl"):
+            continue
+        try:
+            with open(path) as fh:
+                first = json.loads(fh.readline())
+        except (OSError, json.JSONDecodeError):
+            continue
+        session_id = (first.get("payload") or {}).get("id")
+        if session_id:
+            return session_id
+    return None
+
+
+def terminal_resume_command(name, pid):
+    if name == "codex":
+        session_id = codex_session_id(pid)
+        if session_id:
+            return ["codex", "resume", session_id]
+    return list(TERMINAL_RESUME[name])
+
+
+def resumable_foot_command(pid, argv, cwd):
+    """Turn a Foot launch into a safe app-resume launch when possible."""
+    if not argv or os.path.basename(argv[0]) != "foot":
+        return argv, cwd, None
+
+    resume_name = None
+    if "-e" in argv:
+        pos = argv.index("-e")
+        if pos + 1 < len(argv):
+            candidate = os.path.basename(argv[pos + 1])
+            if candidate in TERMINAL_RESUME:
+                resume_name = candidate
+                prefix = argv[:pos + 1]
+                child_name, child_cwd, child_pid = resumable_terminal_child(pid)
+                if child_name == resume_name:
+                    cwd = child_cwd or cwd
+                else:
+                    child_pid = None
+    else:
+        resume_name, child_cwd, child_pid = resumable_terminal_child(pid)
+        if resume_name:
+            cwd = child_cwd or cwd
+            prefix = list(argv) + ["-e"]
+
+    if not resume_name:
+        return argv, cwd, None
+
+    # Foot's process cwd is commonly / even when its shell is in a project.
+    # Preserve an explicit --working-directory and otherwise add the child's.
+    if cwd and not any(arg == "--working-directory" or
+                       arg.startswith("--working-directory=") for arg in prefix):
+        prefix.insert(1, f"--working-directory={cwd}")
+    return prefix + terminal_resume_command(resume_name, child_pid), cwd, resume_name
+
+
 def workspace_of(client):
     ws = client.get("workspace") or {}
     return ws.get("name") or str(ws.get("id", 1))
@@ -665,10 +841,14 @@ def cmd_save(args):
         args.file = named_path(ask_name())
     layout_monitors = json.loads(sock_command("j/monitors"))
     entries, skipped = [], []
+    excluded = set(getattr(args, "except_", []) or [])
     for c in clients():
         cls = c.get("class") or c.get("initialClass") or "?"
         if cls in SKIP_CLASSES:
             skipped.append(f"{cls}: internal")
+            continue
+        if cls in excluded:
+            skipped.append(f"{cls}: excluded")
             continue
         if c.get("floating") and not args.floating:
             skipped.append(f"{cls}: floating")
@@ -680,8 +860,12 @@ def cmd_save(args):
         if not argv:
             skipped.append(f"{cls}: no cmdline")
             continue
+        terminal_resume = None
+        if getattr(args, "resume_terminals", False):
+            argv, cwd, terminal_resume = resumable_foot_command(
+                c.get("pid", 0), argv, cwd)
         gkey, gindex, gactive = group_of(c)
-        entries.append({
+        entry = {
             "class": cls,
             "title": (c.get("title") or "")[:80],
             "workspace": workspace_of(c),
@@ -693,7 +877,10 @@ def cmd_save(args):
             "group": gkey,
             "group_index": gindex,
             "group_active": gactive,
-        })
+        }
+        if terminal_resume:
+            entry["terminal_resume"] = terminal_resume
+        entries.append(entry)
 
     layout = {
         "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -702,10 +889,20 @@ def cmd_save(args):
                      for m in layout_monitors],
         "entries": entries,
     }
-    os.makedirs(os.path.dirname(args.file), exist_ok=True)
+    minimum = getattr(args, "min_windows", 0)
+    if len(entries) < minimum:
+        print(f"kept previous snapshot: found {len(entries)} eligible window(s), "
+              f"need at least {minimum}")
+        return False
+    if getattr(args, "if_changed", False) and same_snapshot(args.file, layout):
+        # mtime means "last observed valid", while saved_at remains the time
+        # the contents changed. Login restore uses mtime for its freshness
+        # guard, so a week-long unchanged work layout does not become stale.
+        os.utime(args.file, None)
+        print(f"snapshot unchanged ({len(entries)} windows); freshness updated")
+        return False
     keep_history(args.file)           # the save about to be replaced, kept aside
-    with open(args.file, "w") as fh:
-        json.dump(layout, fh, indent=2)
+    atomic_json_dump(args.file, layout)
     print(f"saved {len(entries)} windows -> {args.file}")
     for e in entries:
         tab = f" [group tab {e['group_index'] + 1}{'*' if e['group_active'] else ''}]" \
@@ -721,6 +918,7 @@ def cmd_save(args):
     if hist:
         print(f"{hist} earlier save{'s' if hist != 1 else ''} kept in {LAYOUT_HISTORY} "
               f"(restore --history goes back)")
+    return True
 
 
 def cmd_show(args):
@@ -730,6 +928,110 @@ def cmd_show(args):
         tab = f" [tab {e['group_index'] + 1}{'*' if e.get('group_active') else ''}]" \
             if e.get("group") else ""
         print(f"  ws{e['workspace']:<8} {e['class']:<18} {e['title'][:44]}{tab}")
+
+
+def monitor_shape(items):
+    """Stable monitor topology, excluding refresh-rate noise."""
+    shaped = []
+    for monitor in items:
+        mode = str(monitor.get("mode", ""))
+        if mode:
+            dimensions = mode.split("@", 1)[0]
+        else:
+            dimensions = f"{monitor.get('width')}x{monitor.get('height')}"
+        shaped.append((monitor.get("name"), dimensions, round(float(monitor.get("scale", 1)), 3)))
+    return sorted(shaped)
+
+
+def cmd_restore_login(args):
+    """Guarded, non-interactive restore intended for a desktop login hook."""
+    if args.startup_delay:
+        time.sleep(args.startup_delay)
+    try:
+        age = time.time() - os.path.getmtime(args.file)
+    except FileNotFoundError:
+        print(f"no saved session at {args.file}; login restore skipped")
+        return
+    if args.max_age_hours > 0 and age > args.max_age_hours * 3600:
+        print(f"saved session is {age / 3600:.1f}h old (limit "
+              f"{args.max_age_hours:g}h); login restore skipped")
+        return
+
+    layout = load_layout(args.file)
+    current_monitors = json.loads(sock_command("j/monitors"))
+    if monitor_shape(layout.get("monitors", [])) != monitor_shape(current_monitors):
+        args.no_arrange = True
+        print("monitor topology changed; restoring apps and workspaces without "
+              "rebuilding pixel geometry")
+
+    args.dry_run = False
+    args.delay = 0.0
+    args.workspace = None
+    args.workspace_map = None
+    args.no_groups = False
+    args.force = False
+    args.verify = not args.no_verify
+    args.name = None
+    args.pick = False
+    args.history = False
+    args.spill = None
+    args.tuck = False
+    cmd_restore(args)
+
+
+def cmd_watch(args):
+    """Save stable desktop states, but never save shutdown's empty teardown."""
+    if args.startup_delay:
+        time.sleep(args.startup_delay)
+
+    args.pick = False
+    args.if_changed = True
+    print(f"watching Hyprland; stable changes save after {args.debounce:g}s to "
+          f"{args.file}, minimum {args.min_windows} window(s)", flush=True)
+    cmd_save(args)
+
+    stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stream.settimeout(1.0)
+    try:
+        stream.connect(f"{SOCKET_DIR}/.socket2.sock")
+        buffered = b""
+        deadline = None
+        next_periodic = time.monotonic() + args.interval if args.interval > 0 else None
+        while True:
+            try:
+                chunk = stream.recv(65536)
+            except socket.timeout:
+                chunk = None
+            except OSError as exc:
+                print(f"Hyprland event stream closed: {exc}", flush=True)
+                return
+            if chunk == b"":
+                print("Hyprland event stream closed", flush=True)
+                return
+            if chunk:
+                buffered += chunk
+                while b"\n" in buffered:
+                    line, buffered = buffered.split(b"\n", 1)
+                    event = line.decode(errors="replace").partition(">>")[0]
+                    if event in AUTOSAVE_EVENTS:
+                        deadline = time.monotonic() + args.debounce
+            if deadline is not None and time.monotonic() >= deadline:
+                try:
+                    cmd_save(args)
+                except (OSError, ValueError, json.JSONDecodeError) as exc:
+                    print(f"autosave failed: {exc}", file=sys.stderr, flush=True)
+                deadline = None
+                next_periodic = (time.monotonic() + args.interval
+                                 if args.interval > 0 else None)
+            elif (deadline is None and next_periodic is not None and
+                  time.monotonic() >= next_periodic):
+                try:
+                    cmd_save(args)
+                except (OSError, ValueError, json.JSONDecodeError) as exc:
+                    print(f"periodic autosave failed: {exc}", file=sys.stderr, flush=True)
+                next_periodic = time.monotonic() + args.interval
+    finally:
+        stream.close()
 
 
 # ── replay ───────────────────────────────────────────────────────────────────
@@ -2365,6 +2667,12 @@ def main():
     s = sub.add_parser("save", help="snapshot the current layout")
     s.add_argument("--floating", action="store_true",
                    help="include floating windows (their size and position are saved)")
+    s.add_argument("--except", dest="except_", action="append", default=[],
+                   help="class to leave out, repeatable")
+    s.add_argument("--resume-terminals", action="store_true",
+                   help="resume allowlisted apps found inside Foot terminals")
+    s.add_argument("--if-changed", action="store_true",
+                   help="do not rotate or rewrite an identical snapshot")
     s.add_argument("--name", help="save as a named layout in ~/.config/hypr/layouts/")
     s.add_argument("--pick", action="store_true",
                    help="ask for the name in a menu instead of typing it")
@@ -2402,6 +2710,37 @@ def main():
                    help="fold windows not in this layout into the top-left tile "
                         "instead of moving them away")
     r.set_defaults(func=cmd_restore, verify=True)
+
+    rl = sub.add_parser("restore-login",
+                        help="restore a recent session safely from a login hook")
+    rl.add_argument("--startup-delay", type=float, default=6.0,
+                    help="seconds to let the desktop settle (default 6)")
+    rl.add_argument("--max-age-hours", type=float, default=24.0,
+                    help="skip snapshots older than this; 0 disables (default 24)")
+    rl.add_argument("--except", dest="except_", action="append", default=[],
+                    help="class to skip, repeatable")
+    rl.add_argument("--no-verify", action="store_true",
+                    help="skip the final snapshot comparison")
+    rl.set_defaults(func=cmd_restore_login, no_arrange=False)
+
+    wt = sub.add_parser("watch",
+                        help="autosave after the desktop has been stable")
+    wt.add_argument("--debounce", type=float, default=5.0,
+                    help="stable seconds before saving (default 5)")
+    wt.add_argument("--startup-delay", type=float, default=15.0,
+                    help="seconds before the first save (default 15)")
+    wt.add_argument("--interval", type=float, default=120.0,
+                    help="fallback save interval for changes without events; 0 disables "
+                         "(default 120)")
+    wt.add_argument("--min-windows", type=int, default=1,
+                    help="never replace a snapshot below this count (default 1)")
+    wt.add_argument("--floating", action="store_true",
+                    help="include floating windows; dialogs may be transient")
+    wt.add_argument("--except", dest="except_", action="append", default=[],
+                    help="class to leave out, repeatable")
+    wt.add_argument("--resume-terminals", action="store_true",
+                    help="resume allowlisted apps found inside Foot terminals")
+    wt.set_defaults(func=cmd_watch)
 
     sp = sub.add_parser("spill", help="send the focused window elsewhere")
     sp.add_argument("--workspace", help=f"workspace to send it to "
@@ -2442,7 +2781,7 @@ def main():
         cmd_log(args)             # needs neither a socket nor a running replay
         return
     SOCKET_DIR = instance_dir()
-    if args.cmd in ("save", "restore", "spill", "tuck"):
+    if args.cmd in ("save", "restore", "restore-login", "spill", "tuck"):
         # Only a run that changes something logs; `show` and `layouts` must not
         # push the trace of the replay you are trying to read out of the way.
         log_open()
@@ -2451,7 +2790,7 @@ def main():
              f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
     log_line(f"  instance {SOCKET_DIR}")
     locked = False
-    if args.cmd == "restore" and not getattr(args, "dry_run", False):
+    if args.cmd in ("restore", "restore-login") and not getattr(args, "dry_run", False):
         take_replay_lock()
         locked = True
     try:

@@ -1,0 +1,9 @@
+[Unit]
+Description=Restore the last stable Hyprland application layout
+PartOf=graphical-session.target
+After=graphical-session.target wayland-wm@hyprland.desktop.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=90
+ExecStart=%h/.local/bin/hypr-layout --no-progress -f %h/.local/state/hypr-layout/session.json restore-login --startup-delay 6 --max-age-hours 24 --except org.keepassxc.KeePassXC --except 1Password --except Bitwarden --except com.bitwarden.desktop

@@ -1,0 +1,13 @@
+[Unit]
+Description=Save stable Hyprland application layouts
+PartOf=graphical-session.target
+After=graphical-session.target wayland-wm@hyprland.desktop.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hypr-layout -f %h/.local/state/hypr-layout/session.json watch --debounce 5 --interval 120 --startup-delay 45 --min-windows 1 --resume-terminals --except org.keepassxc.KeePassXC --except 1Password --except Bitwarden --except com.bitwarden.desktop
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
